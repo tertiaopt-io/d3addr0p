@@ -44,7 +44,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: shivammathur/setup-php@v2
         with:
-          php-version: '8.2'
+          php-version: '8.3'
       - name: composer install
         working-directory: control-plane
         run: composer install --no-interaction --no-progress

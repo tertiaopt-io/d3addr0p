@@ -346,8 +346,10 @@ func TestKeepalivePingsDoNotDisruptDelivery(t *testing.T) {
 // frees a slot for the SAME IP (and does not leak the map entry at zero).
 func TestPerIPConnectionCap(t *testing.T) {
 	h := &Handler{MaxConnsPerIP: 2}
-	if !h.acquireIP("1.2.3.4") || !h.acquireIP("1.2.3.4") {
-		t.Fatal("the first two connections from an IP must be admitted")
+	for i := 0; i < 2; i++ {
+		if !h.acquireIP("1.2.3.4") {
+			t.Fatal("the first two connections from an IP must be admitted")
+		}
 	}
 	if h.acquireIP("1.2.3.4") {
 		t.Fatal("a third connection from the same IP must be refused")

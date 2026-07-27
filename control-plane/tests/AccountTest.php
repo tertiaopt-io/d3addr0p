@@ -332,6 +332,7 @@ final class AccountTest extends TestCase
         ]])[0]);
         $byKey = [];
         foreach ($this->devicesOf($token1) as $d) {
+            self::assertIsString($d['deviceKey']);
             $byKey[$d['deviceKey']] = $d;
         }
         self::assertTrue($byKey[$this->k]['authorized'], 'device 1 published a key package');
@@ -343,6 +344,7 @@ final class AccountTest extends TestCase
         ]])[0]);
         $byKey2 = [];
         foreach ($this->devicesOf($token1) as $d) {
+            self::assertIsString($d['deviceKey']);
             $byKey2[$d['deviceKey']] = $d;
         }
         self::assertTrue($byKey2[$k2]['authorized'], 'a last-resort-only device is still authorized');
@@ -361,6 +363,7 @@ final class AccountTest extends TestCase
         self::assertNotNull($early->sessionContext($orphanSession));
 
         [, $d4] = $early->upsertDevice($this->u, str_repeat('4', 64));
+        self::assertIsString($d4);
         $early->revokeDevice($this->u, $d4); // device 4: a revoked tombstone
         $revokedBefore = count(array_filter($early->listDevices($this->u), static fn ($d) => $d['revoked']));
 

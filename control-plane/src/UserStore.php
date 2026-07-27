@@ -143,13 +143,14 @@ final class UserStore
             }
             $added = $row['added_at'] ?? null;
             $lastSeen = $row['last_seen_at'] ?? null;
+            $hasKeys = $row['has_keys'] ?? null;
             $out[] = [
                 'deviceId' => $id,
                 'deviceKey' => $pub,
                 'addedAt' => is_numeric($added) ? (int) $added : 0,
                 'lastSeenAt' => is_numeric($lastSeen) ? (int) $lastSeen : 0,
                 'revoked' => ($row['revoked_at'] ?? null) !== null,
-                'authorized' => ((int) ($row['has_keys'] ?? 0)) === 1,
+                'authorized' => (is_numeric($hasKeys) ? (int) $hasKeys : 0) === 1,
             ];
         }
         return $out;
@@ -482,8 +483,10 @@ final class UserStore
         $stmt = $this->pdo->prepare('SELECT window_start, count FROM take_rate WHERE caller = ? AND target = ?');
         $stmt->execute([$caller, $target]);
         $row = $stmt->fetch();
-        if (is_array($row) && (int) ($row['window_start'] ?? 0) === $windowStart) {
-            if ((int) ($row['count'] ?? 0) >= self::TAKE_MAX_PER_WINDOW) {
+        $rowWindow = is_array($row) && is_numeric($row['window_start'] ?? null) ? (int) $row['window_start'] : null;
+        $rowCount = is_array($row) && is_numeric($row['count'] ?? null) ? (int) $row['count'] : 0;
+        if ($rowWindow === $windowStart) {
+            if ($rowCount >= self::TAKE_MAX_PER_WINDOW) {
                 return false; // this caller has hit the per-target claim ceiling for the current window
             }
             $this->pdo->prepare('UPDATE take_rate SET count = count + 1 WHERE caller = ? AND target = ?')
