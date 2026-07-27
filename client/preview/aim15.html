@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>AIM15 verification</title>
+<link rel="stylesheet" href="../src/skin/tokens.css" />
+<link rel="stylesheet" href="../src/skin/transmit.css" />
+<link rel="stylesheet" href="../src/skin/chrome.css" />
+<link rel="stylesheet" href="../src/skin/themes.css" />
+</head>
+<body>
+<div id="root" class="dd-desk"></div>
+<script type="module">
+  // Mount the FULL wired app with the in-memory DemoController so we can drive the interactive
+  // AIM15 behaviors: multi-window overlap (items 3/8), window-relative reflow on resize (item 7),
+  // the fixed-size compose box (item 4), and bold-after-color/font/italic (item 6).
+  import { mountApp, DemoController } from '../dist/app.js';
+  const root = document.getElementById('root');
+  mountApp(root, new DemoController());
+  window.__ready = true;
+</script>
+</body>
+</html>

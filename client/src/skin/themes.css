@@ -1,0 +1,444 @@
+/*
+ * DEAD DROP — optional appearance THEMES (AIM18). Each theme is a class on the desktop root (.dd-desk)
+ * that overrides the design tokens from tokens.css / chrome.css, plus a few element rules for surfaces
+ * that carry hard-coded colors the tokens don't reach. DEFAULT is the absence of any theme class, so the
+ * base skin is never touched (zero regression risk). All same-origin CSS → 100% CSP-safe (style-src 'self').
+ * Per-user color/font tweaks and imported theme packs are applied ON TOP of these via the CSSOM
+ * (root.style.setProperty('--dd-*', ...)), which the strict CSP allows.
+ *
+ * The Winamp / Windows 98 / AIM themes are ORIGINAL CSS recreations of each era's DESIGN LANGUAGE
+ * (palette, 3D bevels, fonts, window chrome, button styling). They bundle no copyrighted skin art and
+ * trace no trademark: the AIM mark is a plain drawn running figure and the Winamp mark a generic EQ-bar
+ * motif, both tiny inline data: SVGs (CSP img-src 'self' data:).
+ */
+
+/* ============================ WINAMP ============================ *
+ * The classic 2.x media-player look: a brushed-GUNMETAL beveled frame with a black green-LCD readout. */
+.dd-theme-winamp {
+  --dd-desk: #0b0b0b;
+  --dd-grid: rgba(255, 255, 255, 0.03);
+  --dd-grid-strong: rgba(255, 255, 255, 0.05);
+  --dd-chrome-ink: #d2d2d2;
+  --dd-chrome-dim: #8f8f8f;
+  --dd-select: #1c3a10;
+  --dd-select-ink: #4bff6a;
+  --dd-radius: 2px;
+  --dd-radius-sm: 1px;
+  /* Brushed gunmetal (not near-black): a light machined top edge falling to mid-charcoal. */
+  --dd-face: linear-gradient(180deg, #4d4d4d 0%, #3f3f3f 12%, #343434 60%, #2a2a2a 100%);
+  --dd-face-hot: linear-gradient(180deg, #585858 0%, #484848 12%, #3c3c3c 60%, #323232 100%);
+  --dd-rim: #000000;
+  --dd-bar: linear-gradient(180deg, #4a4a4a 0%, #333333 55%, #262626 100%);
+  /* Crisp 1px machined bevel: bright NW highlight, black SE shadow, small cast shadow. */
+  --dd-bevel: inset 1px 1px 0 rgba(255, 255, 255, 0.22), inset -1px -1px 0 rgba(0, 0, 0, 0.88), 0 2px 5px rgba(0, 0, 0, 0.55);
+  --dd-bevel-pressed: inset 1px 1px 0 rgba(0, 0, 0, 0.9), inset -1px -1px 0 rgba(255, 255, 255, 0.14);
+  /* Deep black recessed screen (the LCD / playlist wells). */
+  --dd-well: inset 1px 1px 2px rgba(0, 0, 0, 0.95), inset -1px -1px 0 rgba(255, 255, 255, 0.06);
+  --dd-groove: inset 0 1px 0 rgba(0, 0, 0, 0.7), inset 0 2px 0 rgba(255, 255, 255, 0.05);
+  --dd-texture: repeating-linear-gradient(0deg, rgba(255, 255, 255, 0.05) 0 1px, transparent 1px 3px);
+  --dd-chrome-font: "Arial", "Helvetica Neue", "Segoe UI", sans-serif;
+  --dd-chrome-size: 11px;
+  /* Near-black green-tinted phosphor screen for the message area. */
+  --dd-field-center: #0b110b;
+  --dd-field-mid: #070b07;
+  --dd-field-edge: #030503;
+  --dd-field: linear-gradient(180deg, #0c130c 0%, #050805 100%);
+  --dd-field-flat: #070b07;
+  --dd-ink: #24e000;
+  --dd-ink-dim: #159400;
+  --dd-ink-sys: #1cc400;
+  --dd-ink-ghost: #0a5e00;
+  --dd-warn: #ffb300;
+  --dd-secure: #33ff66;
+  /* Monochrome-green world with amber accents, no cyan: self reads like Winamp's near-white "current track". */
+  --dd-name-self: #8bff8b;
+  --dd-name-peer: #ffce4b;
+  --dd-font-msg: "Arial", "Helvetica Neue", "Segoe UI", sans-serif;
+  --dd-msg-weight: 600;
+  --dd-msg-size: clamp(13px, 2.9vw, 15px);
+  --dd-glow: 0 0 2px rgba(40, 240, 80, 0.22);
+  /* The compose caret is a glowing green LCD cursor. --dd-cursor is re-declared as var(--dd-ink) so it
+     re-resolves against THIS theme's green ink (the :root default bakes in the base near-white ink and
+     would otherwise inherit down as a white caret on the black field). */
+  --dd-cursor: var(--dd-ink);
+  --dd-cursor-glow: 0 0 5px rgba(40, 240, 80, 0.55);
+  --dd-scanline: transparent;
+}
+/* Surfaces: brushed-metal body; the buddy tree is a separate BLACK "playlist" screen so rows pop. */
+.dd-theme-winamp .dd-content-well,
+.dd-theme-winamp .dd-channel,
+.dd-theme-winamp .dd-window-body { background: #3a3a3a; }
+.dd-theme-winamp .dd-tree { background: #0a0d0a; border-color: #000000; box-shadow: var(--dd-well); }
+.dd-theme-winamp .dd-tree-buddy:hover { background: rgba(40, 240, 80, 0.14); }
+/* Login/text fields become the black LCD panel with green digits, matching the readout. */
+.dd-theme-winamp .dd-input { background: #0a0d0a; color: var(--dd-ink); box-shadow: var(--dd-well); }
+.dd-theme-winamp .dd-fingerprint { background: #0a0d0a; color: var(--dd-ink); box-shadow: var(--dd-well); }
+/* Thin FLAT titlebar (override the base gloss) with a compact condensed-uppercase title. */
+.dd-theme-winamp .dd-titlebar {
+  padding: 3px 7px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.13), inset 0 -1px 0 rgba(0, 0, 0, 0.9);
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.09em;
+}
+.dd-theme-winamp .dd-title {
+  background: transparent; box-shadow: none; color: var(--dd-chrome-ink);
+  font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; padding: 1px 10px;
+}
+/* Small square dark titlebar buttons (the classic tiny controls). */
+.dd-theme-winamp .dd-winbtn { width: 15px; height: 13px; border-radius: 1px; font-size: 9px; }
+.dd-theme-winamp .dd-winbtn-app { width: 19px; }
+.dd-theme-winamp .dd-menubar {
+  border-radius: 2px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.13), inset 0 -1px 0 rgba(0, 0, 0, 0.85), 0 2px 5px rgba(0, 0, 0, 0.5);
+}
+/* THE GREEN LCD READOUT: the connection headline becomes a black sunken panel with glowing green digits. */
+.dd-theme-winamp .dd-title-conn {
+  font-family: ui-monospace, "Consolas", "DejaVu Sans Mono", "Courier New", monospace;
+  color: #24e000; background: #000000; border: 1px solid #000000;
+  box-shadow: inset 1px 1px 2px rgba(0, 0, 0, 0.95), inset -1px -1px 0 rgba(60, 255, 90, 0.10);
+  text-shadow: 0 0 4px rgba(40, 255, 80, 0.55);
+  padding: 2px 7px; border-radius: 1px; letter-spacing: 0.1em; font-weight: 700;
+}
+.dd-theme-winamp .dd-title-conn:hover { background: #050805; }
+.dd-theme-winamp .dd-title-conn.dd-conn-secure { color: #33ff66; text-shadow: 0 0 6px rgba(50, 255, 100, 0.7); }
+.dd-theme-winamp .dd-title-conn.dd-conn-live { color: #ffb300; text-shadow: 0 0 6px rgba(255, 180, 0, 0.6); }
+.dd-theme-winamp .dd-connp-state {
+  font-family: ui-monospace, "Consolas", "DejaVu Sans Mono", "Courier New", monospace;
+  color: #24e000; background: #000000; align-self: flex-start; padding: 2px 7px; border-radius: 1px;
+  box-shadow: inset 1px 1px 2px rgba(0, 0, 0, 0.9); text-shadow: 0 0 4px rgba(40, 255, 80, 0.5);
+}
+.dd-theme-winamp .dd-connp-gw,
+.dd-theme-winamp .dd-connp-time { font-family: ui-monospace, "Consolas", "DejaVu Sans Mono", "Courier New", monospace; }
+/* Away/profile bubble retinted from navy to charcoal metal (bubble + its tail). */
+.dd-theme-winamp .dd-blhead-status { background: #202020; border-color: rgba(255, 255, 255, 0.10); color: var(--dd-chrome-ink); }
+.dd-theme-winamp .dd-blhead-status::after { border-color: transparent #202020 transparent transparent; }
+/* The buddy-list toolbar takes the charcoal face instead of the stock blue. */
+.dd-theme-winamp .dd-buddytree .dd-tbar-btn { background: var(--dd-face); color: var(--dd-chrome-ink); }
+.dd-theme-winamp .dd-buddytree .dd-tbar-btn:hover { background: var(--dd-face-hot); }
+.dd-theme-winamp .dd-buddytree .dd-tbar-btn .dd-tbar-cap { color: var(--dd-chrome-ink); }
+/* Primary action (Unlock / Send): dark metal with a green label; keyboard focus still shows a ring. */
+.dd-theme-winamp .dd-btn-primary {
+  background: linear-gradient(180deg, #444444 0%, #303030 55%, #222222 100%);
+  color: #4bff6a; border-color: #000000; outline: none;
+}
+.dd-theme-winamp .dd-btn-primary:hover { background: linear-gradient(180deg, #505050 0%, #3a3a3a 55%, #2a2a2a 100%); }
+.dd-theme-winamp .dd-btn-primary:focus-visible { outline: 2px solid var(--dd-select-ink); outline-offset: 2px; }
+/* Unlock-screen hero glow retinted blue -> phosphor green. */
+.dd-theme-winamp .dd-logo-mark { filter: drop-shadow(0 0 12px rgba(40, 240, 80, 0.5)) drop-shadow(0 0 3px rgba(40, 240, 80, 0.85)); }
+.dd-theme-winamp .dd-logo-word { text-shadow: 0 0 12px rgba(40, 240, 80, 0.5); }
+/* A generic little EQUALIZER-BARS mark before each chat title (our own drawn glyph, never a trademark). */
+.dd-theme-winamp .dd-bar span:first-child { display: inline-flex; align-items: center; }
+.dd-theme-winamp .dd-bar span:first-child::before {
+  content: "";
+  width: 1.05em; height: 1.05em; margin-right: 0.45em;
+  background-image: url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2024%2024'%3E%3Cg%20fill='%2324e000'%3E%3Crect%20x='2'%20y='10'%20width='3.4'%20height='11'/%3E%3Crect%20x='7.3'%20y='4'%20width='3.4'%20height='17'/%3E%3Crect%20x='12.6'%20y='13'%20width='3.4'%20height='8'/%3E%3Crect%20x='17.9'%20y='7'%20width='3.4'%20height='14'/%3E%3C/g%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: center; background-size: contain;
+}
+.dd-appear-themebox.dd-theme-winamp .dd-appear-prevbl { background: #0a0d0a; }
+
+/* ============================ WINDOWS 98 ============================ *
+ * The silver 3D-beveled shell: teal desktop, navy->blue caption, square everything, white Notepad fields. */
+.dd-theme-win98 {
+  --dd-desk: #008080;
+  --dd-grid: transparent;
+  --dd-grid-strong: transparent;
+  --dd-chrome-ink: #000000;
+  --dd-chrome-dim: #404040;
+  --dd-select: #000080;
+  --dd-select-ink: #ffffff;
+  --dd-radius: 0px;
+  --dd-radius-sm: 0px;
+  /* The "3D Objects" silver face. Win98 controls do NOT hover-highlight (only the :active sunken bevel). */
+  --dd-face: #c0c0c0;
+  --dd-face-hot: #c0c0c0;
+  --dd-rim: #000000;
+  --dd-bar: linear-gradient(90deg, #000080 0%, #1084d0 100%);
+  /* Exact Win98 3D edges. RAISED: outer white NW / black SE, inner #dfdfdf NW / #808080 SE. */
+  --dd-bevel: inset 1px 1px 0 #ffffff, inset -1px -1px 0 #000000, inset 2px 2px 0 #dfdfdf, inset -2px -2px 0 #808080;
+  /* PRESSED: the raised edges inverted, so the button visibly sinks. */
+  --dd-bevel-pressed: inset 1px 1px 0 #000000, inset -1px -1px 0 #ffffff, inset 2px 2px 0 #808080, inset -2px -2px 0 #dfdfdf;
+  /* SUNKEN client edge for text wells: outer #808080 NW / #ffffff SE, inner #000000 NW / #dfdfdf SE. */
+  --dd-well: inset 1px 1px 0 #808080, inset -1px -1px 0 #ffffff, inset 2px 2px 0 #000000, inset -2px -2px 0 #dfdfdf;
+  --dd-groove: none;
+  --dd-texture: none;
+  --dd-chrome-font: "Tahoma", "MS Sans Serif", "Segoe UI", sans-serif;
+  --dd-field-center: #ffffff;
+  --dd-field-mid: #ffffff;
+  --dd-field-edge: #ffffff;
+  --dd-field: #ffffff;
+  --dd-field-flat: #ffffff;
+  --dd-ink: #000000;
+  --dd-ink-dim: #404040;
+  --dd-ink-sys: #000080;
+  --dd-ink-ghost: #808080;
+  --dd-warn: #a00000;
+  --dd-secure: #008000;
+  --dd-name-self: #c00000;
+  --dd-name-peer: #0a1a8c;
+  --dd-font-msg: "Tahoma", "MS Sans Serif", "Segoe UI", sans-serif;
+  --dd-msg-weight: 400;
+  --dd-msg-size: clamp(13px, 3vw, 16px);
+  --dd-glow: none;
+  /* Re-resolve the caret against THIS theme's dark ink (else the near-white :root literal vanishes on white). */
+  --dd-cursor: var(--dd-ink);
+  --dd-cursor-glow: none;
+  --dd-scanline: transparent;
+}
+/* Let the 4-line bevel do ALL the framing: no stray black keyline on raised or sunken controls, no soft shadow. */
+.dd-theme-win98 .dd-window,
+.dd-theme-win98 .dd-btn,
+.dd-theme-win98 .dd-winbtn,
+.dd-theme-win98 .dd-menubar,
+.dd-theme-win98 .dd-tbar,
+.dd-theme-win98 .dd-menu-dropdown,
+.dd-theme-win98 .dd-input,
+.dd-theme-win98 .dd-tree,
+.dd-theme-win98 .dd-fingerprint { border-color: transparent; }
+.dd-theme-win98 .dd-window { box-shadow: var(--dd-bevel); }
+/* TITLEBAR: flat navy gradient (override the base gloss), thin bar, bold white LEFT-aligned caption. */
+.dd-theme-win98 .dd-titlebar { box-shadow: none; padding: 2px 3px; justify-content: flex-start; }
+.dd-theme-win98 .dd-title {
+  color: #ffffff; background: transparent; box-shadow: none; font-weight: 700; letter-spacing: 0;
+  text-align: left; max-width: none; padding: 1px 40px 1px 24px;
+}
+/* WINDOW CONTROLS: small SQUARE grey raised buttons, flush right, black glyphs, no red hover. */
+.dd-theme-win98 .dd-winctl { right: 3px; gap: 2px; }
+.dd-theme-win98 .dd-winmenu { left: 3px; }
+.dd-theme-win98 .dd-winbtn {
+  width: 16px; height: 14px; border-radius: 0; color: #000000; background: var(--dd-face);
+  box-shadow: var(--dd-bevel); font-size: 10px; font-weight: 700;
+}
+.dd-theme-win98 .dd-winbtn:hover { background: var(--dd-face); }
+.dd-theme-win98 .dd-winbtn:active { box-shadow: var(--dd-bevel-pressed); }
+/* Minimize glyph = a short bar on the button's bottom edge (hide the renderer's en-dash, draw the bar). */
+.dd-theme-win98 .dd-winctl .dd-winbtn:not(.dd-winbtn-close) { font-size: 0; position: relative; }
+.dd-theme-win98 .dd-winctl .dd-winbtn:not(.dd-winbtn-close)::before {
+  content: ""; position: absolute; left: 50%; bottom: 3px; width: 7px; height: 2px; background: #000000; transform: translateX(-50%);
+}
+/* Close keeps a plain black X (no red-tinted hover). */
+.dd-theme-win98 .dd-winbtn-close:hover { background: var(--dd-face); color: #000000; }
+.dd-theme-win98 .dd-winbtn-app { width: 18px; }
+/* MENU BAR + DROPDOWNS: flat silver, square, raised; navy highlight on hover; a hard offset shadow. */
+.dd-theme-win98 .dd-menubar { background: #c0c0c0; border-radius: 0; box-shadow: var(--dd-bevel); }
+.dd-theme-win98 .dd-menu-item { color: #000000; }
+.dd-theme-win98 .dd-menu-dropdown { background: #c0c0c0; border-radius: 0; box-shadow: var(--dd-bevel), 2px 2px 0 rgba(0, 0, 0, 0.35); }
+.dd-theme-win98 .dd-menu-dropitem { color: #000000; }
+/* Panels stay silver; the message field stays white. */
+.dd-theme-win98 .dd-content-well,
+.dd-theme-win98 .dd-channel,
+.dd-theme-win98 .dd-window-body { background: #c0c0c0; }
+.dd-theme-win98 .dd-detail-empty { color: #000000; }
+/* Sunken WHITE fields: login inputs, the buddy well, the fingerprint/recovery/SAS plates. */
+.dd-theme-win98 .dd-input { background: #ffffff; color: #000000; box-shadow: var(--dd-well); }
+.dd-theme-win98 .dd-tree { background: #ffffff; box-shadow: var(--dd-well); }
+.dd-theme-win98 .dd-fingerprint { background: #ffffff; color: #000000; box-shadow: var(--dd-well); }
+/* Connection status rides the silver header (AIM26): dark, legible ink. */
+.dd-theme-win98 .dd-title-conn { color: #000080; }
+.dd-theme-win98 .dd-title-conn.dd-conn-secure { color: #008000; }
+.dd-theme-win98 .dd-title-conn.dd-conn-live { color: #8a5a00; }
+/* BUTTONS: grey raised; the primary gets the Win98 default-button flush black frame + a dotted focus box. */
+.dd-theme-win98 .dd-btn { position: relative; }
+.dd-theme-win98 .dd-btn-primary { color: #000000; background: var(--dd-face); outline: none; box-shadow: var(--dd-bevel), 0 0 0 1px #000000; }
+.dd-theme-win98 .dd-btn-primary:hover { background: var(--dd-face); }
+.dd-theme-win98 .dd-btn-primary:active { box-shadow: var(--dd-bevel-pressed), 0 0 0 1px #000000; }
+.dd-theme-win98 .dd-btn:focus-visible { outline: none; }
+.dd-theme-win98 .dd-btn:focus-visible::after { content: ""; position: absolute; inset: 3px; border: 1px dotted #000000; pointer-events: none; }
+/* TOOLBARS silver (override the app's forced navy/blue). */
+.dd-theme-win98 .dd-tbar { background: #c0c0c0; box-shadow: var(--dd-bevel); }
+.dd-theme-win98 .dd-buddytree .dd-tbar-btn { color: #000000; background: var(--dd-face); }
+.dd-theme-win98 .dd-buddytree .dd-tbar-btn:hover { background: var(--dd-face); }
+.dd-theme-win98 .dd-buddytree .dd-tbar-btn .dd-tbar-ico svg { fill: #000000; }
+.dd-theme-win98 .dd-buddytree .dd-tbar-btn .dd-tbar-cap { color: #404040; }
+/* Chat log/compose: shrink the CRT-scaled type toward Win98 "Notepad" text (a user's chosen size still wins). */
+.dd-theme-win98 .dd .dd-log,
+.dd-theme-win98 .dd .dd-compose,
+.dd-theme-win98 .dd .dd-compose-input,
+.dd-theme-win98 .dd .dd-compose-rich .dd-rt-edit { font-size: var(--dd-msg-user-size, clamp(13px, 3cqi, 18px)); }
+.dd-appear-themebox.dd-theme-win98 .dd-appear-prevbl { background: #ffffff; box-shadow: var(--dd-well); }
+
+/* ============================ h4x0r ============================ *
+ * Green-on-black terminal / Matrix: black surfaces, bright-green text + glowing frames, a scrolling
+ * digital-rain canvas behind IM logs (injected from JS; see the .dd-matrix rules below). */
+.dd-theme-h4x0r {
+  --dd-desk: #000000;
+  --dd-grid: rgba(0, 255, 65, 0.12);
+  --dd-grid-strong: rgba(0, 255, 65, 0.22);
+  --dd-chrome-ink: #00ff41;
+  --dd-chrome-dim: #00a82b;
+  --dd-select: #013b12;
+  --dd-select-ink: #9dffb0;
+  --dd-radius: 0px;
+  --dd-radius-sm: 0px;
+  --dd-face: #020a02;
+  --dd-face-hot: #063206;
+  --dd-rim: #00ff41;
+  --dd-bar: linear-gradient(180deg, #041804 0%, #010a01 100%);
+  --dd-bevel: inset 0 0 0 1px #00ff41, 0 0 9px rgba(0, 255, 65, 0.42);
+  --dd-bevel-pressed: inset 0 0 0 1px #00a82b;
+  --dd-well: inset 0 0 0 1px #017a20;
+  --dd-groove: inset 0 0 0 1px rgba(0, 255, 65, 0.3);
+  --dd-texture: repeating-linear-gradient(0deg, rgba(0, 255, 65, 0.06) 0 1px, transparent 1px 3px);
+  --dd-chrome-font: ui-monospace, "Cascadia Mono", "DejaVu Sans Mono", "Courier New", monospace;
+  --dd-field-center: #000700;
+  --dd-field-mid: #000400;
+  --dd-field-edge: #000000;
+  --dd-field: #000300;
+  --dd-field-flat: #000300;
+  --dd-ink: #00ff41;
+  --dd-ink-dim: #00b82f;
+  --dd-ink-sys: #00d838;
+  --dd-ink-ghost: #016618;
+  --dd-warn: #eaff00;
+  --dd-secure: #00ff41;
+  --dd-name-self: #9dffb0;
+  --dd-name-peer: #eaff00;
+  --dd-font-msg: ui-monospace, "Cascadia Mono", "DejaVu Sans Mono", "Courier New", monospace;
+  --dd-msg-weight: 600;
+  --dd-glow: 0 0 4px rgba(0, 255, 65, 0.6), 0 0 11px rgba(0, 255, 65, 0.35);
+  --dd-cursor-glow: 0 0 7px rgba(0, 255, 65, 0.7);
+  --dd-scanline: rgba(0, 40, 0, 0.28);
+}
+.dd-theme-h4x0r .dd-content-well,
+.dd-theme-h4x0r .dd-tree,
+.dd-theme-h4x0r .dd-channel,
+.dd-theme-h4x0r .dd-window-body { background: #000500; border-color: #017a20; }
+.dd-theme-h4x0r .dd-btn-primary { background: #001a06; color: #00ff41; border-color: #00ff41; }
+.dd-theme-h4x0r .dd-btn-primary:hover { background: #013012; }
+.dd-appear-themebox.dd-theme-h4x0r .dd-appear-prevbl { background: #000500; border-color: #017a20; }
+
+/* The digital-rain canvas, injected as the FIRST child of each .dd chat container by the app (JS), sitting
+   BEHIND the log; the log/compose text stays fully opaque above it. Only present under the h4x0r theme. */
+.dd-matrix {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  opacity: 0.5;
+}
+.dd-theme-h4x0r .dd-log,
+.dd-theme-h4x0r .dd-sub,
+.dd-theme-h4x0r .dd-bar,
+.dd-theme-h4x0r .dd-compose,
+.dd-theme-h4x0r .dd-imbar { position: relative; z-index: 1; background: transparent; }
+/* The in-terminal retro scrollbar (AIM20) sits above the rain too — but KEEPS its gutter background
+   (unlike the log, which is deliberately transparent so the rain shows behind the text). The buddy-icon
+   column (AIM23) also lifts above the rain so the icons stay crisp instead of dimmed behind it. */
+.dd-theme-h4x0r .dd-scrollbar,
+.dd-theme-h4x0r .dd-chat-icons { position: relative; z-index: 1; }
+
+/* ============================ AIM ============================ *
+ * The classic AOL Instant Messenger buddy-list look, recreated in ORIGINAL CSS (no AOL trademark art):
+ * a silver Win9x frame, a friendly blue caption, a white buddy well with bold group headers, and a yellow
+ * running-figure mark we draw ourselves. Same silver-bevel bones as Windows 98, retinted to AIM's blue. */
+.dd-theme-aim {
+  --dd-desk: #3a6ea5;                       /* medium AOL blue behind the windows */
+  --dd-grid: rgba(255, 255, 255, 0.05);
+  --dd-grid-strong: rgba(255, 255, 255, 0.09);
+  --dd-chrome-ink: #000000;
+  --dd-chrome-dim: #565656;                 /* dim label ink, kept above WCAG AA on the silver face */
+  --dd-select: #316ac5;                     /* classic system-highlight blue (menus, buddy selection) */
+  --dd-select-ink: #ffffff;
+  --dd-radius: 0px;                          /* square Win9x window corners */
+  --dd-radius-sm: 0px;
+  --dd-face: #d4d0c8;                        /* the warm silver "Windows Classic 3D Objects" of the AIM era */
+  --dd-face-hot: #e2ded6;
+  --dd-rim: #808080;
+  /* Friendly AOL blue, a near-flat Win9x-style HORIZONTAL active-caption grade (dark left -> lighter right). */
+  --dd-bar: linear-gradient(90deg, #1f5aa8 0%, #3f7ecb 55%, #5a97dd 100%);
+  --dd-bevel: inset 1px 1px 0 #ffffff, inset -1px -1px 0 #000000, inset 2px 2px 0 #f1efe9, inset -2px -2px 0 #808080;
+  --dd-bevel-pressed: inset 1px 1px 0 #000000, inset -1px -1px 0 #ffffff, inset 2px 2px 0 #808080, inset -2px -2px 0 #f1efe9;
+  --dd-well: inset 1px 1px 0 #808080, inset -1px -1px 0 #ffffff, inset 2px 2px 0 #404040, inset -2px -2px 0 #f1efe9;
+  --dd-groove: none;
+  --dd-texture: none;
+  --dd-chrome-font: "Tahoma", "MS Sans Serif", "Geneva", "Segoe UI", sans-serif;
+  --dd-field-center: #ffffff;
+  --dd-field-mid: #ffffff;
+  --dd-field-edge: #ffffff;
+  --dd-field: #ffffff;                       /* white IM message area */
+  --dd-field-flat: #ffffff;
+  --dd-ink: #000000;
+  --dd-ink-dim: #555555;
+  --dd-ink-sys: #0a4bbd;                      /* system lines in AIM blue */
+  --dd-ink-ghost: #9a9a9a;
+  --dd-warn: #c05a00;
+  --dd-secure: #1a8a1a;
+  --dd-name-self: #cc0000;                    /* AIM default: YOUR text is red */
+  --dd-name-peer: #0022cc;                    /* the buddy's text is blue */
+  --dd-font-msg: "Helvetica Neue", "Arial", "Tahoma", "MS Sans Serif", sans-serif;
+  --dd-msg-weight: 400;
+  --dd-msg-size: clamp(13px, 2.6vw, 16px);
+  --dd-glow: none;
+  /* Re-resolve the caret against the dark ink (see the Windows 98 note) so it stays visible on white. */
+  --dd-cursor: var(--dd-ink);
+  --dd-cursor-glow: none;
+  --dd-scanline: transparent;
+}
+/* Titlebar: flat AOL-blue bar (override the base gloss), white BOLD caption. */
+.dd-theme-aim .dd-titlebar { box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.22); border-bottom: 1px solid #16407e; }
+.dd-theme-aim .dd-title { color: #ffffff; background: transparent; box-shadow: none; font-weight: 700; letter-spacing: 0.02em; text-shadow: 0 1px 1px rgba(0, 0, 0, 0.35); }
+/* The titlebar app-menu button on EVERY window becomes the yellow running figure (our own mark). It still
+   opens the app menu, so each window reads AIM at a glance. */
+.dd-theme-aim .dd-winbtn-app { background: transparent; border-color: transparent; box-shadow: none; }
+.dd-theme-aim .dd-winbtn-app .dd-logo-ic { display: none; }
+.dd-theme-aim .dd-winbtn-app::before {
+  content: "";
+  width: 16px; height: 16px;
+  background-image: url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2024%2024'%3E%3Cg%20fill='none'%20stroke='%23f4c20d'%20stroke-width='2.9'%20stroke-linecap='round'%20stroke-linejoin='round'%3E%3Ccircle%20cx='16.4'%20cy='4.2'%20r='2.7'%20fill='%23f4c20d'%20stroke='none'/%3E%3Cpath%20d='M15.4%208.1%20L11.8%2013.2'/%3E%3Cpath%20d='M11.8%2013.2%20L15.6%2015.1%20L14.3%2020.3'/%3E%3Cpath%20d='M11.8%2013.2%20L8.4%2014.9%20L6.0%2018.7'/%3E%3Cpath%20d='M14.1%209.5%20L18.4%2010.7'/%3E%3Cpath%20d='M14.1%209.5%20L9.8%2010.4%20L8.0%2013.7'/%3E%3C/g%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: center; background-size: contain;
+  filter: drop-shadow(0 1px 0 rgba(0, 0, 0, 0.35));
+}
+.dd-theme-aim .dd-winbtn { color: #000000; }
+/* Connection status on the silver header (AIM26): dark, AA-legible tones. */
+.dd-theme-aim .dd-title-conn { color: #254e97; }
+.dd-theme-aim .dd-title-conn.dd-conn-secure { color: #0b5d0b; }
+.dd-theme-aim .dd-title-conn.dd-conn-live { color: #9a4600; }
+.dd-theme-aim .dd-title-conn:hover { background: rgba(0, 0, 0, 0.06); }
+/* Menubar / silver surfaces. */
+.dd-theme-aim .dd-menubar { background: #d4d0c8; }
+.dd-theme-aim .dd-menu-item { color: #000000; }
+.dd-theme-aim .dd-content-well,
+.dd-theme-aim .dd-channel,
+.dd-theme-aim .dd-window-body { background: #d4d0c8; }
+.dd-theme-aim .dd-detail-empty { color: #000000; }
+/* The AIM "Send" / primary action: the signature blue button (no Mac default-ring). */
+.dd-theme-aim .dd-btn-primary {
+  background: linear-gradient(180deg, #5a97dd 0%, #2f66b4 100%); color: #ffffff; border-color: #1c4d94; outline: none;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.45), inset 0 -1px 0 rgba(0, 0, 0, 0.32); text-shadow: 0 1px 1px rgba(0, 0, 0, 0.3);
+}
+.dd-theme-aim .dd-btn-primary:hover { background: linear-gradient(180deg, #6aa6ea 0%, #3d74c2 100%); }
+.dd-theme-aim .dd-btn-primary:active { box-shadow: inset 0 2px 3px rgba(0, 0, 0, 0.4); }
+/* White sunken text fields (login inputs, fingerprint plates) to match the light theme. */
+.dd-theme-aim .dd-input { background: #ffffff; color: #000000; box-shadow: var(--dd-well); }
+.dd-theme-aim .dd-fingerprint { background: #ffffff; color: #000000; box-shadow: var(--dd-well); }
+/* The WHITE sunken buddy-list well. */
+.dd-theme-aim .dd-tree { background: #ffffff; border-color: #808080; gap: 0; padding: 2px; }
+/* AIM-style GROUP HEADERS: flat bold rows with a triangle + count, no 3D button chrome. */
+.dd-theme-aim .dd-tree-group { background: transparent; border: 0; box-shadow: none; padding: 2px 4px; font-weight: 700; font-size: 12px; color: #000000; border-radius: 0; }
+.dd-theme-aim .dd-tree-group:hover { background: #eef2f8; }
+.dd-theme-aim .dd-tree-group:active { box-shadow: none; }
+.dd-theme-aim .dd-tree-static:hover { background: transparent; }
+.dd-theme-aim .dd-tree-tri { color: #000000; }
+.dd-theme-aim .dd-tree-folder { display: none; }   /* AIM groups carry no folder icon, just the triangle */
+.dd-theme-aim .dd-tree-name { font-weight: 700; }
+.dd-theme-aim .dd-tree-count { color: #6d6d6d; }
+/* Dense buddy rows: online black, offline/away dimmed, a pale hover, and the token-blue SELECTION fill. */
+.dd-theme-aim .dd-tree-kids { padding: 0 0 3px 20px; gap: 0; }
+.dd-theme-aim .dd-tree-buddy { padding: 1px 6px; font-size: 12px; border-radius: 0; }
+.dd-theme-aim .dd-tree-buddy:hover { background: #eef2f8; }
+.dd-theme-aim .dd-tree-buddy-off .dd-tree-label { color: #5f5f5f; }
+.dd-theme-aim .dd-tree-sub { color: #5f5f5f; }
+/* Away bubble -> the classic pale-yellow tooltip with a crisp 1px BLACK frame (tail follows suit). */
+.dd-theme-aim .dd-blhead-status { background: #ffffe1; border-color: #000000; color: #000000; }
+.dd-theme-aim .dd-blhead-status::before { border-color: transparent #000000 transparent transparent; }
+.dd-theme-aim .dd-blhead-status::after { border-color: transparent #ffffe1 transparent transparent; }
+.dd-theme-aim .dd-blhead-caret { color: #565656; }
+.dd-theme-aim .dd-blhead-stbtn.dd-st-away { color: #565656; }
+/* Bottom toolbar: grey Win9x beveled buttons on the silver face (override the app's forced blue). */
+.dd-theme-aim .dd-tbar { background: #d4d0c8; box-shadow: inset 0 1px 0 #ffffff, inset 0 -1px 0 #808080; }
+.dd-theme-aim .dd-buddytree .dd-tbar-btn { color: #000000; background: #d4d0c8; box-shadow: var(--dd-bevel); }
+.dd-theme-aim .dd-buddytree .dd-tbar-btn:hover { background: #e2ded6; }
+.dd-theme-aim .dd-buddytree .dd-tbar-btn:active { box-shadow: var(--dd-bevel-pressed); }
+.dd-theme-aim .dd-buddytree .dd-tbar-btn .dd-tbar-ico svg { fill: #333333; }
+.dd-theme-aim .dd-buddytree .dd-tbar-btn .dd-tbar-cap { color: #000000; }
+.dd-theme-aim .dd-buddytree .dd-tbar-btn[disabled] .dd-tbar-ico svg { fill: #9a9a9a; }
+.dd-theme-aim .dd-buddytree .dd-tbar-btn[disabled] .dd-tbar-cap { color: #9a9a9a; }
+.dd-appear-themebox.dd-theme-aim .dd-appear-prevbl { background: #ffffff; border-color: #808080; }

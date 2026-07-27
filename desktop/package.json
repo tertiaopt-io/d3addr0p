@@ -1,0 +1,50 @@
+{
+  "name": "deaddrop-desktop",
+  "productName": "DEAD DROP",
+  "version": "0.0.1",
+  "private": true,
+  "description": "DEAD DROP desktop shell (Electron). macOS test build: a hardened window onto the E2E client.",
+  "license": "AGPL-3.0-or-later",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "icons": "node scripts/gen-app-icons.mjs",
+    "dist:mac": "electron-builder --mac --dir",
+    "dist:mac:zip": "electron-builder --mac zip",
+    "dist:win": "electron-builder --win zip"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.d3addr0p.desktop",
+    "productName": "DEAD DROP",
+    "directories": {
+      "buildResources": "build"
+    },
+    "mac": {
+      "icon": "build/icon.icns",
+      "category": "public.app-category.social-networking",
+      "target": [
+        {
+          "target": "dir",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ]
+    },
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        {
+          "target": "zip",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    }
+  }
+}

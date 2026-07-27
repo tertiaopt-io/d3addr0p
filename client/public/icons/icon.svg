@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <!-- DEAD DROP app icon: the teardrop-enclosing-a-keyhole mark, white on the signature deep blue.
+       Full-bleed background so it also works as a "maskable" PWA icon; the mark sits inside the safe zone. -->
+  <rect width="512" height="512" fill="#0a18a8"/>
+  <g transform="translate(110 140) scale(12)">
+    <path fill-rule="evenodd" fill="#eef3ff" d="M12 1.6 C 9.2 5.4 5 9.9 5 14.6 A 7 7 0 0 0 19 14.6 C 19 9.9 14.8 5.4 12 1.6 Z M 10.9 14.42 A 2.3 2.3 0 1 1 13.1 14.42 L 13.7 17.6 L 10.3 17.6 Z"/>
+  </g>
+</svg>

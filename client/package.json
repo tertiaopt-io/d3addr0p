@@ -1,0 +1,28 @@
+{
+  "name": "@deaddrop/client",
+  "version": "0.0.0",
+  "private": true,
+  "description": "DEAD DROP client. Holds all keys and does ALL cryptography. M0: skeleton + strict typecheck gate.",
+  "license": "AGPL-3.0-or-later",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "bundle:wasm": "mkdir -p wasm && cp ../crypto/pkg/deaddrop_crypto.js ../crypto/pkg/deaddrop_crypto_bg.wasm wasm/",
+    "bundle:adapter": "esbuild src/wsadapter.ts --bundle --format=esm --platform=browser --external:./transport.js --external:./session.js --outfile=dist/wsadapter.bundle.js",
+    "bundle:qrdecode": "esbuild src/qrdecode.ts --bundle --format=esm --platform=browser --minify --outfile=dist/qrdecode.bundle.js",
+    "build": "tsc && npm run bundle:adapter && npm run bundle:qrdecode && npm run bundle:wasm",
+    "lint": "eslint . --max-warnings 0",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@bufbuild/protobuf": "^2.2.0",
+    "@typescript-eslint/eslint-plugin": "^7.16.0",
+    "@typescript-eslint/parser": "^7.16.0",
+    "esbuild": "^0.21.5",
+    "eslint": "^8.57.0",
+    "fake-indexeddb": "^6.0.0",
+    "happy-dom": "^20.10.6",
+    "typescript": "^5.5.0",
+    "vitest": "^2.0.0"
+  }
+}

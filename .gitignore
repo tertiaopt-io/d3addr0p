@@ -1,0 +1,37 @@
+# dependencies / build output
+node_modules/
+client/node_modules/
+client/dist/
+client/wasm/
+control-plane/vendor/
+gateway/bin/
+
+# rust / wasm build output (regenerate via `wasm-pack build`)
+crypto/target/
+crypto/pkg/
+
+# Generated wire bindings policy:
+# - Go (gateway/internal/wire/**) is COMMITTED so the gateway builds in CI with no codegen step.
+# - PHP and TS bindings are regenerated via `make gen` and kept out of source control; they are
+#   excluded from their tiers' typecheck/lint gates.
+control-plane/gen/
+client/src/wire/
+
+# os / editor
+.DS_Store
+*.swp
+
+# LOCAL AGENT/EDITOR STATE — MUST NEVER BE PUBLISHED.
+# .claude/settings.local.json holds live server credentials (ssh user, passwords, host). Publishing
+# this repo with that file included would leak production access in the first commit.
+.claude/
+
+# NOT PUBLISHED (user decision, "source only"): these describe the LIVE deployment, its host, and its
+# vhost. The application source is public; the operational footprint of one running instance is not.
+infra/
+docs/deploy-runbook.md
+
+# Build artifacts of the desktop shell (published as GitHub release assets, never committed).
+desktop/dist/
+desktop/build/
+deploy/

@@ -1,0 +1,73 @@
+/*
+ * DEAD DROP — "transmit" skin design tokens (M5, brief §2). Canonical source of truth for the
+ * skin; the standalone preview at client/preview/transmit.html is a snapshot of these.
+ *
+ * PROVENANCE: an ORIGINAL retro-terminal derivation from the documented description in §2.1
+ * (a "severely blue instant message system", oversized blocky type, a minimalist fictional-OS
+ * shell on a mid-90s CRT) plus era conventions. Tuned interactively with the owner. Per §A.6 the
+ * exact look is a product preference, not a security control.
+ *
+ * Accessibility floor (kept regardless of skin): pale ink on the deep field clears WCAG AA;
+ * all effects (vignette stays, but scanlines, phosphor glow, cursor blink, boot sweep, near-
+ * expiry throb) are disabled under prefers-reduced-motion.
+ */
+
+/* Page base (was an inline <style> in index.html; moved here so the deploy needs no inline styles
+   and a strict CSP can drop style-src 'unsafe-inline'). */
+html, body { margin: 0; height: 100%; }
+body { background: #07070c; }
+
+:root {
+  /* Field: the signature blue, rendered as a subtle CRT-glass vignette (brighter center, darker
+     edges) rather than a flat fill, so it reads like a lit phosphor screen. */
+  --dd-field-center: #0d1fbe;
+  --dd-field-mid: #0a18a8;
+  --dd-field-edge: #060f78;
+  --dd-field: radial-gradient(125% 105% at 50% 36%, var(--dd-field-center) 0%, var(--dd-field-mid) 52%, var(--dd-field-edge) 100%);
+  --dd-field-flat: #0a18a8; /* solid fallback / theme-color meta */
+
+  /* Ink: pale cool-white message text; a dimmer tint for chrome/status. */
+  --dd-ink: #eef3ff;
+  --dd-ink-dim: #9db8f0;
+  --dd-ink-sys: #7e9bea; /* system/console lines */
+  --dd-ink-ghost: #5f78c0; /* destroyed-message tombstone */
+
+  /* Sender-name colors for the AIM-style "Name: message" line (AIM23): yours vs theirs, distinct hues
+     that stay legible on the deep-blue field. Each theme overrides these for its own surface. */
+  --dd-name-self: #8fd0ff;
+  --dd-name-peer: #ffce8a;
+
+  /* Functional tones: warm for near-expiry countdown, green for the secure transmit indicator. */
+  --dd-warn: #ffce5e;
+  --dd-secure: #74f0a8;
+
+  /* Block cursor. */
+  --dd-cursor: var(--dd-ink);
+  --dd-cursor-blink: 1.1s;
+
+  /* Type. Oversized blocky monospace body (heavier weight); system stacks only, no bundled fonts. */
+  --dd-font-msg: ui-monospace, "Cascadia Mono", "DejaVu Sans Mono", "Courier New", monospace;
+  --dd-font-chrome: "Chicago", "Geneva", system-ui, -apple-system, sans-serif;
+  --dd-msg-weight: 600;
+  --dd-msg-size: clamp(21px, 6.4vw, 29px);
+  --dd-msg-leading: 1.42;
+  --dd-chrome-size: 12px;
+  --dd-margin: 24px; /* left gutter of the single-column log */
+}
+
+/* Authenticity layer: phosphor glow, scanlines, motion. Off under reduced motion. */
+@media (prefers-reduced-motion: no-preference) {
+  :root {
+    /* Layered phosphor bloom: a tight bright halo plus a wider soft one (tuned restrained). */
+    --dd-glow: 0 0 4px rgba(205, 224, 255, 0.5), 0 0 12px rgba(150, 188, 255, 0.4), 0 0 22px rgba(120, 165, 255, 0.22);
+    --dd-cursor-glow: 0 0 7px rgba(190, 212, 255, 0.5), 0 0 16px rgba(150, 188, 255, 0.4);
+    --dd-scanline: rgba(0, 0, 26, 0.22);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dd-glow: none;
+    --dd-cursor-glow: none;
+    --dd-scanline: transparent;
+  }
+}

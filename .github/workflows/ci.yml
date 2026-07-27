@@ -1,0 +1,88 @@
+name: ci
+
+# Build-breaking typecheck + lint gates from M0 (brief §6). No tier may merge red.
+on:
+  push:
+  pull_request:
+
+jobs:
+  schema:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bufbuild/buf-setup-action@v1
+      - run: buf lint
+        working-directory: schema
+
+  gateway:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - name: vet
+        working-directory: gateway
+        run: go vet ./...
+      - name: staticcheck
+        working-directory: gateway
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+          "$(go env GOPATH)/bin/staticcheck" ./...
+      - name: test
+        working-directory: gateway
+        run: go test ./...
+      - name: build (static, CGO disabled)
+        working-directory: gateway
+        env:
+          CGO_ENABLED: '0'
+        run: go build ./...
+
+  control-plane:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+      - name: composer install
+        working-directory: control-plane
+        run: composer install --no-interaction --no-progress
+      - name: phpstan (max)
+        working-directory: control-plane
+        run: vendor/bin/phpstan analyse --no-progress
+
+  crypto:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: test (native, real OpenMLS keygen)
+        working-directory: crypto
+        run: cargo test
+      - uses: jetli/wasm-pack-action@v0.4.0
+      - name: wasm build (browser package)
+        working-directory: crypto
+        run: wasm-pack build --target web
+
+  client:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: install
+        working-directory: client
+        run: npm ci || npm install --no-audit --no-fund
+      - name: typecheck (strict)
+        working-directory: client
+        run: npm run typecheck
+      - name: lint
+        working-directory: client
+        run: npm run lint
+      - name: test
+        working-directory: client
+        run: npm test

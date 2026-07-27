@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="theme-color" content="#0a18a8" />
+<title>DEAD DROP</title>
+<link rel="stylesheet" href="../src/skin/tokens.css" />
+<link rel="stylesheet" href="../src/skin/transmit.css" />
+<style> html, body { margin: 0; height: 100%; } body { display: flex; flex-direction: column; } </style>
+</head>
+<body>
+<div class="dd">
+  <div class="dd-sweep"></div>
+  <div class="dd-bar"><span>DEAD DROP</span><span><span class="dd-tx"></span>SECURE</span></div>
+  <div class="dd-sub"><span>RAVEN</span><span>key 5F&middot;A2&middot;91&middot;C4 &middot; verified</span></div>
+  <div class="dd-log" id="log">
+    <div class="dd-msg dd-sys">&raquo; channel open &middot; forward secrecy active</div>
+    <div class="dd-msg" data-from="RAVEN" data-burn="24">drop confirmed at the usual place</div>
+    <div class="dd-who" data-for="RAVEN">RAVEN &nbsp;&middot;&nbsp; <span class="t">burns 0:24</span></div>
+    <div class="dd-msg">acknowledged</div>
+    <div class="dd-who">YOU</div>
+    <div class="dd-msg" data-from="YOU2" data-burn="9">moving now</div>
+    <div class="dd-who" data-for="YOU2">YOU &nbsp;&middot;&nbsp; <span class="t">burns 0:09</span></div>
+  </div>
+  <div class="dd-compose"><span class="dd-prompt">&rsaquo;</span><span class="dd-msg">en route</span><span class="dd-cursor"></span></div>
+</div>
+<script>
+(function(){
+  function fmt(s){ return "burns 0:" + (s<10? "0"+s : s); }
+  var items = Array.prototype.map.call(document.querySelectorAll('.dd-msg[data-burn]'), function(el){
+    return { msg:el, label:document.querySelector('.dd-who[data-for="'+el.dataset.from+'"]'),
+             left:parseInt(el.dataset.burn,10), full:parseInt(el.dataset.burn,10),
+             text:el.textContent, name:el.dataset.from.replace(/[0-9]/g,''), destroyed:false };
+  });
+  function restore(it){
+    it.left=it.full; it.destroyed=false;
+    it.msg.className='dd-msg'; it.msg.textContent=it.text;
+    it.label.className='dd-who'; it.label.style.display='';
+    it.label.innerHTML = it.name + ' &nbsp;&middot;&nbsp; <span class="t">'+fmt(it.left)+'</span>';
+  }
+  setInterval(function(){
+    var allGone=true;
+    items.forEach(function(it){
+      if(it.destroyed) return; allGone=false; it.left--;
+      if(it.left<=0){ it.destroyed=true; it.msg.className='dd-msg dd-gone';
+        it.msg.innerHTML='&#9634; message destroyed'; it.label.style.display='none'; }
+      else { var near=it.left<=10;
+        it.msg.className='dd-msg'+(near?' dd-warn':'');
+        it.label.className='dd-who'+(near?' dd-warn dd-near':''); it.label.style.display='';
+        it.label.innerHTML = it.name + ' &nbsp;&middot;&nbsp; <span class="t">'+fmt(it.left)+'</span>'; }
+    });
+    if(allGone){ setTimeout(function(){ items.forEach(restore); }, 2600); }
+  }, 1000);
+})();
+</script>
+</body>
+</html>

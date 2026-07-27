@@ -1,0 +1,19 @@
+version: v2
+plugins:
+  # Go bindings for the gateway.
+  - remote: buf.build/protocolbuffers/go
+    out: ../gateway/internal/wire
+    opt: paths=source_relative
+
+  # TypeScript bindings for the client (ts-proto, strict).
+  - remote: buf.build/community/stephenh-ts-proto
+    out: ../client/src/wire
+    opt:
+      - esModuleInterop=true
+      - useExactTypes=true
+      - forceLong=string
+      - outputServices=false
+
+  # PHP bindings for the control plane.
+  - remote: buf.build/protocolbuffers/php
+    out: ../control-plane/gen

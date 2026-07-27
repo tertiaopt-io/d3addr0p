@@ -1,0 +1,117 @@
+syntax = "proto3";
+
+// DEAD DROP wire schema — the single source of truth for every type that crosses the
+// gateway/bus boundary. Codegen targets: Go (gateway), PHP (control plane), TS (client).
+//
+// INVARIANT (brief §4.1): the server only ever sees opaque ciphertext. Nothing in this
+// schema may carry plaintext content or a sender identity. `payload` is E2E ciphertext the
+// server cannot read. There is no sender field — sender identity lives inside `payload`
+// (sealed sender, implemented at M3). No field here may be persisted to disk (§5.10).
+
+package deaddrop.v1;
+
+option go_package = "github.com/deaddrop/gateway/internal/wire/deaddrop/v1;deaddropv1";
+
+// An opaque, server-uninterpretable message. The ONLY shape that crosses the bus.
+message Envelope {
+  // Random, client-generated. Used for dedup and delete-on-delivery. Not derived from
+  // content or identity.
+  bytes message_id = 1;
+
+  // Opaque per-recipient mailbox identifier. NOT an account id and NOT linkable to a
+  // sender by the server. Routing key for fan-out only.
+  string routing_key = 2;
+
+  // End-to-end ciphertext. Opaque to every server tier. At M3 the client pads this to a
+  // fixed size bucket before it is sent, so length leaks nothing.
+  bytes payload = 3;
+
+  // Transport-layer TTL backstop for undelivered ciphertext (§3.2). The real readability
+  // lifetime is encoded INSIDE the encrypted payload and enforced client-side after
+  // decryption; this is only how long the bus holds an undelivered blob before dropping it.
+  uint32 ttl_seconds = 4;
+}
+
+// Client -> gateway.
+message ClientFrame {
+  oneof body {
+    Subscribe         subscribe   = 1;  // start receiving for a mailbox
+    Envelope          publish     = 2;  // send an opaque envelope
+    Ack               ack         = 3;  // acknowledge delivery so the bus can drop the blob
+    KeyExchangeOffer  send_offer  = 4;  // start a conversation (gated handshake)
+    KeyExchangeAccept send_accept = 5;  // accept a peer's offer
+  }
+}
+
+// Gateway -> client.
+message ServerFrame {
+  oneof body {
+    Envelope          deliver        = 1;  // an opaque envelope addressed to a subscribed mailbox
+    Receipt           receipt        = 2;  // publish accepted
+    Error             error          = 3;
+    KeyExchangeOffer  deliver_offer  = 4;  // an incoming conversation offer
+    KeyExchangeAccept deliver_accept = 5;  // a peer accepted our offer
+  }
+}
+
+// The gated mutual key-exchange-and-accept handshake (ADR-009). No message may be sent in a
+// conversation until both parties have exchanged KeyPackages and each has accepted.
+//
+// HONEST LIMIT (ADR-009 residual 1): in this build the exchange is in-app only, relayed by
+// the service. There is NO out-of-band verification, so authenticity is trust-on-first-use:
+// a hostile or compelled server could substitute keys here (MITM). The `from_signature_key`
+// and `key_package` fields are public MLS material, not opaque ciphertext, and the relay can
+// read and tamper with them. This is documented and accepted "for now"; do not treat the
+// handshake as a defense against the server until OOB verification is re-added.
+message KeyExchangeOffer {
+  bytes  from_signature_key = 1;  // offerer identity (Ed25519 public key)
+  bytes  key_package        = 2;  // offerer's MLS KeyPackage (TLS-serialized)
+  string conversation_id    = 3;  // random, client-generated
+  string to_routing_key     = 4;  // recipient mailbox the gateway relays this to
+}
+
+message KeyExchangeAccept {
+  bytes  from_signature_key = 1;  // accepter identity (Ed25519 public key)
+  bytes  key_package        = 2;  // accepter's MLS KeyPackage (TLS-serialized)
+  string conversation_id    = 3;
+  bytes  mls_welcome        = 4;  // optional MLS Welcome if the accepter created the group
+  string to_routing_key     = 5;  // recipient mailbox the gateway relays this to
+}
+
+message Subscribe {
+  // Opaque mailbox the client wants delivery for. How a client proves it may subscribe to
+  // a mailbox without revealing identity is an M3 concern (sealed-sender tokens); M0 carries
+  // the field only.
+  string routing_key = 1;
+  // Opaque, stable, SECRET-KEYED per-mailbox delivery-cursor tag (the client derives it per subject
+  // from a device secret, so two mailboxes of one device carry unrelated tags: the gateway's registry
+  // cannot be read as a device-to-conversation map, and the tag is not reversible to the device's
+  // public key). With it, the bus holds each blob until EVERY known cursor of the mailbox has acked
+  // it (or the TTL expires) and REDELIVERS un-acked blobs when that cursor re-subscribes, so a device
+  // that crashes after a blob was delivered but before it durably processed it sees the blob again
+  // instead of losing it forever (at-most-once -> at-least-once per cursor). Empty = a legacy client;
+  // it gets the old first-ack-drops semantics.
+  string consumer_id = 2;
+}
+
+message Ack {
+  bytes message_id = 1;
+}
+
+message Receipt {
+  bytes message_id = 1;
+}
+
+message Error {
+  ErrorCode code = 1;
+  // Human-readable, non-sensitive. Never echo payload bytes or routing details here.
+  string detail = 2;
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  ERROR_CODE_MALFORMED   = 1;
+  ERROR_CODE_TOO_LARGE   = 2;  // payload exceeds the max bucket
+  ERROR_CODE_RATE_LIMIT  = 3;
+  ERROR_CODE_INTERNAL    = 4;
+}

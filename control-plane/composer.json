@@ -1,0 +1,30 @@
+{
+    "name": "deaddrop/control-plane",
+    "description": "DEAD DROP typed PHP control plane (account/identity/config APIs). Never touches message bytes.",
+    "type": "project",
+    "license": "AGPL-3.0-or-later",
+    "require": {
+        "php": ">=8.2"
+    },
+    "require-dev": {
+        "phpstan/phpstan": "^2.0",
+        "phpunit/phpunit": "^11"
+    },
+    "autoload": {
+        "psr-4": {
+            "DeadDrop\\ControlPlane\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "DeadDrop\\ControlPlane\\Tests\\": "tests/"
+        }
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "scripts": {
+        "phpstan": "phpstan analyse",
+        "check": ["@phpstan"]
+    }
+}

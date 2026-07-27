@@ -1,0 +1,40 @@
+[package]
+name = "deaddrop-crypto"
+version = "0.0.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "DEAD DROP client crypto core: OpenMLS (RFC 9420) compiled to WASM. All crypto runs in the browser."
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+openmls = { version = "0.6", features = ["js"] }
+openmls_rust_crypto = "0.3"
+openmls_traits = "0.3"
+openmls_basic_credential = "0.3"
+tls_codec = "0.4"
+# Account Authorization Key (ADR-022 P2): a separate Ed25519 root, off the MLS ciphersuite, with
+# deterministic from-seed keygen and arbitrary-payload sign/verify. Signing is deterministic
+# (RFC 8032), so it needs no entropy source on wasm.
+ed25519-dalek = "2"
+# SHA-256 for the device-provisioning short-authentication-string (the 6-word verification code) and
+# its signer-side guard (ADR-022 P4, model b).
+sha2 = "0.10"
+# X25519 ECDH for the QR-pairing sealed grant (ADR-022 add-a-device-by-QR): the seed-holder seals the
+# device certificate to the new device's ephemeral public key, transmitted optically in the QR.
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+wasm-bindgen = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zeroize = "1"
+# At-rest layer (M2, ADR-015): independent of the MLS ciphersuite.
+argon2 = "0.5"
+chacha20poly1305 = { version = "0.10", features = ["getrandom"] }
+# getrandom must use the browser entropy source for wasm32-unknown-unknown.
+getrandom = { version = "0.2", features = ["js"] }
+
+[profile.release]
+opt-level = "s"
+lto = true

@@ -1,0 +1,347 @@
+/*
+ * DEAD DROP — transmit screen skin (M5). Reusable CSS layer over the working app, driven by
+ * tokens.css. The signature blue transmit view is the one bold element; everything else stays
+ * quiet around it (§2.1). All motion/effects degrade under prefers-reduced-motion via the tokens.
+ *
+ * Apply `.dd` to the screen root. Markup contract (see client/preview/transmit.html):
+ *   .dd > .dd-bar, .dd-sub, .dd-chatbody (.dd-chat-icons + .dd-logrow > .dd-log
+ *     (.dd-line[.dd-name/.dd-msg/.dd-meta] / .dd-sys / .dd-gone)), .dd-compose
+ */
+
+.dd {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  color: var(--dd-ink);
+  font-family: var(--dd-font-msg);
+  background: var(--dd-field);
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  /* The CRT terminal is a size container, so its text scales with the WINDOW (resize the chat and the
+     message/compose type reflows to fit) instead of the whole viewport. */
+  container-type: inline-size;
+}
+/* Message + compose type sized to the window width (cqi), clamped so it stays legible when the window is
+   very narrow or very wide. The `.dd` scope raises specificity ABOVE the base .dd-log/.dd-compose rules
+   below so this container-relative size wins over the viewport-relative --dd-msg-size (otherwise resizing
+   the window would not reflow the type). The rich editor inherits its size from .dd-compose via `font:
+   inherit`, so scaling the container scales the editor too. */
+.dd .dd-log,
+.dd .dd-compose,
+.dd .dd-compose-input,
+.dd .dd-compose-rich .dd-rt-edit {
+  /* A user-chosen Message Appearance size (AIM19) wins; otherwise the window-width auto-scale. */
+  font-size: var(--dd-msg-user-size, clamp(16px, 4.2cqi, 27px));
+}
+
+/* CRT scanline overlay (confined to the terminal so it works embedded in a window). */
+.dd::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  pointer-events: none;
+  background: repeating-linear-gradient(var(--dd-scanline) 0 1px, transparent 1px 3px);
+}
+
+/* One-time boot sweep on mount. */
+.dd-sweep {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: 42px;
+  z-index: 6;
+  pointer-events: none;
+  background: linear-gradient(rgba(220, 232, 255, 0.16), transparent);
+  animation: dd-sweep 1.25s ease-out 1 forwards;
+}
+@keyframes dd-sweep {
+  0% { transform: translateY(-60px); opacity: 1; }
+  100% { transform: translateY(102vh); opacity: 0; }
+}
+
+.dd-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: calc(env(safe-area-inset-top) + 15px) 18px 8px;
+  color: var(--dd-ink-dim);
+  font-size: var(--dd-chrome-size);
+  letter-spacing: 0.18em;
+}
+
+/* Secure transmit indicator. */
+.dd-tx {
+  display: inline-block;
+  width: 0.52em;
+  height: 0.86em;
+  margin-right: 0.35em;
+  vertical-align: -1px;
+  background: var(--dd-secure);
+  box-shadow: 0 0 7px rgba(116, 240, 168, 0.6);
+  animation: dd-pulse 2s ease-in-out infinite;
+}
+@keyframes dd-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+/* Peer identity line: name + verified key fingerprint (sealed-sender recognition). */
+.dd-sub {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0 18px 12px;
+  color: var(--dd-ink-dim);
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  opacity: 0.78;
+  border-bottom: 1px solid rgba(157, 184, 240, 0.2);
+}
+
+/* The chat body: the AIM-style buddy-icon column beside the log (AIM23). The column holds both icons —
+   the other person on top, you below — filled async by wireChatIcons. It takes the vertical space the
+   log used to; the log (+ its scrollbar) flexes to fill the rest of the width. */
+.dd-chatbody {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: stretch;
+  /* Clip the fixed-size icon column when the window is dragged to its short floor: without this the
+     bottom icon (flex:none, cannot shrink) would spill below into the transparent compose row. */
+  overflow: hidden;
+}
+.dd-chat-icons {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  /* Peer icon at the TOP of the message area, your own icon pushed to the BOTTOM (down by the compose
+     box), so the two sit apart along the left edge like the classic AIM window. A min gap keeps them
+     from touching if the window is dragged very short (space-between would otherwise collapse them). */
+  justify-content: space-between;
+  gap: 10px;
+  padding: 22px 6px 12px 14px;
+}
+/* Note to Self carries only your own icon: keep it at the top rather than floating mid-column. */
+.dd-chat-icons-solo { justify-content: flex-start; }
+/* Each icon slot renders a .dd-id-preview (renderIconPreview); size them down to classic buddy-icon
+   scale and give them the beveled frame that reads as a picture in the window. */
+.dd-ci-slot { flex: none; }
+.dd-chat-icons .dd-id-preview {
+  width: 48px;
+  height: 48px;
+  font-size: 26px;
+}
+.dd-chat-icons .dd-id-preview-empty { font-size: 20px; }
+
+/* The log + its WORKING retro scrollbar side by side (AIM20). The native scrollbar is hidden below, so
+   the beveled one (arrows / track / draggable thumb, wired in wireLogScrollbars) is the only one. */
+.dd-logrow {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+}
+.dd-log {
+  flex: 1;
+  min-width: 0;
+  padding: 22px 18px 10px var(--dd-margin);
+  overflow-y: auto;
+  font-size: var(--dd-msg-size);
+  line-height: var(--dd-msg-leading);
+  font-weight: var(--dd-msg-weight);
+  scrollbar-width: none; /* the retro scrollbar beside it is the real control */
+}
+.dd-log::-webkit-scrollbar { display: none; }
+
+/* AIM-style message line: "Name: message" on one row (AIM23). The name is colored per sender (yours vs
+   theirs) so a glance tells you who spoke, matching the classic IM window. */
+.dd-line {
+  margin-bottom: 9px;
+  text-shadow: var(--dd-glow);
+  line-height: var(--dd-msg-leading);
+}
+.dd-name {
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  margin-right: 0.1em;
+  white-space: nowrap;
+}
+/* Your name one color, the other person's another. Defaults suit the deep-blue field; each theme
+   overrides these to stay legible on its own surface (themes.css). */
+.dd-name-self { color: var(--dd-name-self, #8fd0ff); }
+.dd-name-peer { color: var(--dd-name-peer, #ffce8a); }
+.dd-msg {
+  text-shadow: var(--dd-glow);
+}
+/* The trailing ephemeral markers (burn countdown / recall). Quiet by default, warm near expiry. */
+.dd-meta {
+  margin-left: 0.55em;
+  color: var(--dd-ink-dim);
+  font-size: 0.62em;
+  letter-spacing: 0.09em;
+  white-space: nowrap;
+}
+.dd-burn { vertical-align: 1px; }
+
+/* An inline image inside a message: bounded so a shared picture never blows the log or the compose out of
+   shape, and it scrolls with the conversation like any other line. In the log it can be a fair size; in
+   the one-line compose it stays a small thumbnail so the box does not balloon while you write. */
+.dd-log .dd-img {
+  display: block;
+  max-width: min(100%, 320px);
+  max-height: 320px;
+  height: auto;
+  margin: 4px 0 2px;
+  border-radius: 6px;
+  border: 1px solid rgba(157, 184, 240, 0.25);
+}
+.dd-compose-rich .dd-rt-edit .dd-img {
+  display: inline-block;
+  max-width: 60%;
+  max-height: 3.4em;
+  height: auto;
+  vertical-align: bottom;
+  border-radius: 4px;
+}
+
+.dd-sys {
+  margin-bottom: 22px;
+  color: var(--dd-ink-sys);
+  font-weight: 400;
+  font-size: 0.6em;
+}
+
+/* Near-expiry: warm tone + soft throb, on the line and its trailing markers. */
+.dd-line.dd-warn,
+.dd-line.dd-warn .dd-msg,
+.dd-meta.dd-warn { color: var(--dd-warn); }
+.dd-near { animation: dd-throb 1s ease-in-out infinite; }
+@keyframes dd-throb {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+/* Revoke control on your own until-revoked messages (cooperative recall). */
+.dd-msg-revoke {
+  margin-left: 0.6em;
+  padding: 0 6px;
+  border: 1px solid rgba(157, 184, 240, 0.35);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--dd-ink-dim);
+  font: inherit;
+  font-size: 12px;
+  letter-spacing: 0.09em;
+  cursor: pointer;
+}
+.dd-msg-revoke:hover {
+  color: var(--dd-warn);
+  border-color: var(--dd-warn);
+}
+
+/* Destroyed-message tombstone (crypto-erased). */
+.dd-gone {
+  margin-bottom: 22px;
+  padding-left: 0.7em;
+  color: var(--dd-ink-ghost);
+  font-weight: 400;
+  font-size: 0.6em;
+  letter-spacing: 0.05em;
+  border-left: 2px solid rgba(95, 120, 192, 0.5);
+}
+
+.dd-compose {
+  display: flex;
+  align-items: center;
+  gap: 0.42em;
+  padding: 14px 18px calc(env(safe-area-inset-bottom) + 18px);
+  border-top: 1px solid rgba(157, 184, 240, 0.2);
+  font-size: clamp(20px, 6vw, 25px);
+  font-weight: var(--dd-msg-weight);
+}
+.dd-prompt { color: var(--dd-ink-dim); }
+/* The live compose field: a terminal-native input, not the boxed chrome input. */
+.dd-compose-input {
+  flex: 1;
+  width: auto;
+  min-width: 0;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  border-radius: 0;
+  padding: 0;
+  color: var(--dd-ink);
+  font: inherit;
+  font-size: clamp(20px, 6vw, 25px);
+  font-weight: var(--dd-msg-weight);
+  caret-color: var(--dd-cursor);
+}
+.dd-compose-input:focus { outline: none; }
+.dd-compose .dd-btn { font-size: 14px; font-weight: 400; }
+/* The RICH compose as a terminal prompt line: the formatting toolbar rides above, and the input
+   itself is a flat transparent CRT line led by the › prompt — ONE line tall, growing line by line
+   with the text (a contenteditable grows with its content once no min-height inflates it). */
+.dd-rt-line { display: flex; align-items: baseline; gap: 0.4em; min-width: 0; }
+.dd-rt-line .dd-prompt { flex: none; }
+.dd-compose-rich .dd-rt-edit,
+.dd-compose-rich .dd-rt-edit.dd-rt-edit-1 {
+  flex: 1;
+  min-width: 0;
+  min-height: 1.35em;
+  max-height: 8.5em;
+  overflow-y: auto;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  color: var(--dd-ink);
+  caret-color: var(--dd-cursor);
+  font: inherit;
+}
+/* The hint stays small and dim so the empty prompt still reads as a prompt, not a form field. */
+.dd-compose-rich .dd-rt-edit:empty::before { color: var(--dd-ink-dim); font-size: 13px; }
+/* Emoji quick-bar above the chat compose box. */
+.dd-emoji-bar {
+  display: flex;
+  gap: 6px;
+  padding: 6px 18px;
+  flex-wrap: wrap;
+  border-top: 1px solid rgba(157, 184, 240, 0.12);
+}
+.dd-emoji-btn {
+  font: inherit;
+  font-size: 20px;
+  line-height: 1;
+  padding: 3px 7px;
+  border-radius: 7px;
+  border: 1px solid rgba(157, 184, 240, 0.18);
+  background: rgba(157, 184, 240, 0.06);
+  color: inherit;
+  cursor: pointer;
+}
+.dd-emoji-btn:hover { background: rgba(157, 184, 240, 0.14); }
+.dd-cursor {
+  display: inline-block;
+  width: 0.6em;
+  height: 1.05em;
+  background: var(--dd-cursor);
+  box-shadow: var(--dd-cursor-glow);
+  animation: dd-blink var(--dd-cursor-blink) steps(1) infinite;
+}
+@keyframes dd-blink {
+  0%, 49% { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dd-sweep { display: none; }
+  .dd-tx,
+  .dd-cursor,
+  .dd-near { animation: none; }
+}
