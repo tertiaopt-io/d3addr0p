@@ -35,3 +35,4 @@ docs/deploy-runbook.md
 desktop/dist/
 desktop/build/
 deploy/
+.phpunit.result.cache
