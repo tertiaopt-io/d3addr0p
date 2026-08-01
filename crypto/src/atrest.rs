@@ -138,4 +138,25 @@ mod tests {
         assert_eq!(p.t_cost(), ARGON_T_COST);
         assert_eq!(p.p_cost(), ARGON_P_COST);
     }
+
+    #[test]
+    #[ignore] // timing probe, run with: cargo test perf_argon -- --ignored --nocapture
+    fn perf_argon2id_cost_per_derivation() {
+        // Sign-in now runs this TWICE: once for the vault KEK (random per-account salt) and once for
+        // the v2 auth secret (deterministic salt). The two salts cannot be shared without collapsing
+        // the domain separation, so this is the per-derivation price of that decision.
+        use std::time::Instant;
+        let salt = [7u8; 16];
+        let _ = derive_master_key_inner("warmup", &salt); // page in the 64 MiB working set
+        let mut total = 0u128;
+        let runs = 5;
+        for i in 0..runs {
+            let t = Instant::now();
+            let _ = derive_master_key_inner("correct horse battery staple", &salt).unwrap();
+            let us = t.elapsed().as_micros();
+            total += us;
+            println!("argon2id run {i}: {}ms", us / 1000);
+        }
+        println!("argon2id mean: {}ms (native release)", total / runs as u128 / 1000);
+    }
 }

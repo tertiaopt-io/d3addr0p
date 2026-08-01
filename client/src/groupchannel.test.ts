@@ -1,5 +1,12 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { GroupChannel, formatContact, type GroupDeps, type DeviceTarget } from './groupchannel.js';
+import {
+  GroupChannel,
+  formatContact,
+  type GroupDeps,
+  type GroupPersistence,
+  type DeviceTarget,
+  type PendingWelcome,
+} from './groupchannel.js';
 import { encodeList, type GroupConversationLike } from './group.js';
 import {
   frameMessage,
@@ -54,8 +61,13 @@ class FakeConv implements GroupConversationLike {
   pending: string | null = null; // a staged add awaiting its echo
   pendingRemove: string | null = null; // a staged remove awaiting its echo
   fromOwnAccount = false; // whether the NEXT received app frame is flagged as from our own account
+  ratchetFlushes = 0; // how many times the receive-ratchet flush was invoked (item 10 coverage)
   constructor(private readonly sig: string, extra: string[] = [hx('bb')]) {
     this.members = [this.sig, ...extra];
+  }
+  flushReceiveRatchet(_conversationId: string): boolean {
+    this.ratchetFlushes += 1;
+    return true;
   }
   signaturePublicKeyHex(): string {
     return this.sig;
@@ -161,7 +173,10 @@ class FakeConv implements GroupConversationLike {
   mailboxTag(subject: string): string {
     return 'ctag-' + subject; // a deterministic per-subject tag (the real wasm derives a secret-keyed hash)
   }
-  joinFromWelcome(): string {
+  // Takes the Welcome bytes (like the real wasm) even though this base fake ignores them; PairedConv
+  // below overrides it to derive the group id from those bytes, which is what makes a two-device
+  // convergence assertion meaningful.
+  joinFromWelcome(_welcome: Uint8Array): string {
     this.hasGroup = true;
     this.epoch = 0;
     return GID;
@@ -177,7 +192,7 @@ class FakeConv implements GroupConversationLike {
     return encodeList([gidBytes(), this.receiveBlob(ct)]);
   }
   // The tagged received blob for this message; receive wraps it with the group id (self-routing).
-  private receiveBlob(ct: Uint8Array): Uint8Array {
+  protected receiveBlob(ct: Uint8Array): Uint8Array {
     if (ct[0] === APP) {
       // tag 0 (application), then the from-own-account flag byte, then the plaintext.
       return new Uint8Array([0, this.fromOwnAccount ? 1 : 0, ...ct.slice(1)]);
@@ -263,6 +278,50 @@ class FakeConv implements GroupConversationLike {
   certEpoch(): number {
     return 0;
   }
+  // ADR-022 P7 denylist. `revoked` is the accepted set; ingest models the wasm's fail-closed check by
+  // throwing on anything that is not one of `acceptable`.
+  revoked = new Set<string>();
+  acceptable: Set<string> | null = null; // null = accept everything
+  minted: Array<{ key: string; seq: number }> = [];
+  revokeDevice(deviceSigKeyHex: string, issuedSeq: number): string {
+    this.minted.push({ key: deviceSigKeyHex, seq: issuedSeq });
+    const record = `rec-${deviceSigKeyHex}`;
+    this.revoked.add(record);
+    return record;
+  }
+  ingestRevocation(recordHex: string): boolean {
+    if (this.acceptable !== null && !this.acceptable.has(recordHex)) {
+      throw new Error('revocation record did not verify under this account key');
+    }
+    if (this.revoked.has(recordHex)) {
+      return false;
+    }
+    this.revoked.add(recordHex);
+    return true;
+  }
+  revokedCount(): number {
+    return this.revoked.size;
+  }
+  // SG2 self-heal. `unlinkedGroups` marks a group as provably dead; abandonDeadSelfGroup mirrors the
+  // wasm guards (recorded-self AND dead), so a test can prove a LIVE self-group is never abandoned.
+  unlinkedGroups = new Set<string>();
+  abandoned: string[] = [];
+  channelUnlinked(conversationId: string): boolean {
+    return this.unlinkedGroups.has(conversationId);
+  }
+  abandonDeadSelfGroup(conversationId: string, recordedSelf: boolean): boolean {
+    if (!recordedSelf) {
+      throw new Error('not a recorded own-devices group');
+    }
+    if (!this.unlinkedGroups.has(conversationId)) {
+      throw new Error('this own-devices group is still reachable');
+    }
+    this.abandoned.push(conversationId);
+    return true;
+  }
+  accountFloor(): number {
+    return this.revoked.size;
+  }
   // The birth-gated self-group create; null models an older wasm (the wrapper falls back to createGroup).
   createSelfGroupThrow: string | null = null;
   createSelfGroup(_blob: Uint8Array): Uint8Array {
@@ -278,6 +337,36 @@ class FakeConv implements GroupConversationLike {
   }
   wipe(): void {
     /* no-op */
+  }
+}
+
+// A SECOND conversation joined from a Welcome, so a test can drive two live groups at once. The crypto
+// layer holds every group in one object and self-routes by the group id inside the ciphertext, so the
+// fake routes by a distinct app tag rather than by mailbox (both groups share `gmbox-${epoch}` here).
+const GID_B = 'ef01';
+const APP_B = 0xab; // an application frame the fake routes to the SECOND group
+
+class TwoGroupConv extends FakeConv {
+  flushed: string[] = []; // the group id of every flushReceiveRatchet call, in order
+  private joinedB = false;
+  override joinFromWelcome(): string {
+    this.joinedB = true;
+    return GID_B;
+  }
+  override listConversations(): string[] {
+    const open = super.listConversations();
+    return this.joinedB ? [...open, GID_B] : open;
+  }
+  override flushReceiveRatchet(conversationId: string): boolean {
+    this.flushed.push(conversationId);
+    return true;
+  }
+  override receive(ct: Uint8Array): Uint8Array {
+    if (ct[0] === APP_B) {
+      // tag 0 (application) + the from-own-account flag, routed to the second group
+      return encodeList([new Uint8Array([0xef, 0x01]), new Uint8Array([0, 0, ...ct.slice(1)])]);
+    }
+    return super.receive(ct);
   }
 }
 
@@ -549,6 +638,138 @@ describe('GroupChannel', () => {
     await new Promise((r) => setTimeout(r, 0)); // let the FIFO-chained persist + ack settle
     expect(messages).toContainEqual({ direction: 'in', text: 'hello team', ownAuthored: false });
     expect(events.some((e) => e.kind === 'inbound-message')).toBe(true);
+    // honest-limits item 10: once the plaintext is stored under its own key, the MLS ratchet that
+    // produced it must be pushed forward and re-sealed, or a seized powered-off device re-derives it.
+    // The flush is debounced, so it runs when the timer fires, not inline.
+    expect(conv.ratchetFlushes).toBe(0);
+    scheduled.forEach((cb) => cb());
+    expect(conv.ratchetFlushes).toBe(1);
+  });
+
+  it('coalesces a burst of arrivals into ONE ratchet flush (each flush costs a send generation)', async () => {
+    await ch.connectGateway('ws://x/ws');
+    await ch.startConversation([{ deviceKey: hx('bb'), keyPackage: new Uint8Array([7]) }]);
+    for (const text of ['one', 'two', 'three', 'four']) {
+      deliver('gmbox-0', new Uint8Array([APP, ...padToBucket(frameMessage(new TextEncoder().encode(text), LIFE))]));
+    }
+    await new Promise((r) => setTimeout(r, 0));
+    scheduled.forEach((cb) => cb());
+    expect(conv.ratchetFlushes).toBe(1);
+  });
+
+  it('coalesces the flush ACROSS conversations: two busy conversations still cost ONE container re-seal', async () => {
+    // The flush is per group (each has its own ratchet) but the re-seal is NOT: resealSelf serializes and
+    // seals EVERY conversation into one blob. An earlier cut debounced per conversation and re-sealed
+    // inside each timer, so an account with N busy conversations paid N full seals (measured at ~46ms and
+    // 450KB for fifty). Both conversations must flush; only one seal may follow.
+    const two = new TwoGroupConv(SELF);
+    const localScheduled: Array<() => void> = [];
+    let reseals = 0;
+    let localHandlers: TransportHandlers;
+    const localTx = new FakeTransport();
+    const localDeps: GroupDeps = {
+      connect: (_url, h) => {
+        localHandlers = h;
+        return localTx as unknown as Transport;
+      },
+      makeConversation: () => two,
+      pushEvent: () => {},
+      schedule: (_ms, cb) => {
+        localScheduled.push(cb);
+        return localScheduled.length;
+      },
+      cancel: () => {},
+      sealConversation: () => new Uint8Array(),
+      restoreConversation: () => two,
+      sasDigestHex: () => '00'.repeat(32),
+    };
+    const persistence: GroupPersistence = {
+      loadSelf: () => Promise.resolve(null),
+      saveSelf: () => Promise.resolve(),
+      resealSelf: () => {
+        reseals += 1;
+        return Promise.resolve(true);
+      },
+      recoverySeedHex: () => Promise.resolve(''),
+    };
+    const c = new GroupChannel(localDeps, () => Promise.resolve(), () => Promise.resolve(), persistence);
+    await c.connectGateway('ws://x/ws');
+    await c.startConversation([{ deviceKey: hx('bb'), keyPackage: new Uint8Array([7]) }]); // conversation A
+    localHandlers!.onDeliver({ messageId: new Uint8Array([1]), routingKey: SELF, payload: new Uint8Array([0x57]), ttlSeconds: 60 });
+    await new Promise((r) => setTimeout(r, 0)); // conversation B joins from the Welcome
+    localScheduled.length = 0;
+    reseals = 0;
+    const body = (tag: number, text: string): Uint8Array =>
+      new Uint8Array([tag, ...padToBucket(frameMessage(new TextEncoder().encode(text), LIFE))]);
+    localHandlers!.onDeliver({ messageId: new Uint8Array([2]), routingKey: 'gmbox-0', payload: body(APP, 'to A'), ttlSeconds: 60 });
+    localHandlers!.onDeliver({ messageId: new Uint8Array([3]), routingKey: 'gmbox-0', payload: body(APP_B, 'to B'), ttlSeconds: 60 });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(localScheduled).toHaveLength(1); // ONE timer covers both conversations
+    localScheduled.forEach((cb) => cb());
+    await new Promise((r) => setTimeout(r, 0));
+    expect(two.flushed).toEqual([GID, GID_B]); // yet BOTH ratchets advanced
+    expect(reseals).toBe(1); // and the whole container was sealed exactly once
+  });
+
+  it('ADR-022 P7: mints a revocation record, and a record that does not verify never enters the denylist', async () => {
+    // The denylist is the only thing that excludes a revoked device that still holds the account seed
+    // (it re-certifies itself above any epoch floor). So two properties matter here: a revoke must
+    // actually produce a record, and a record from anywhere else must survive exactly one check.
+    const two = new FakeConv(SELF);
+    let reseals = 0;
+    const localDeps: GroupDeps = {
+      connect: (_url, h) => {
+        void h;
+        return new FakeTransport() as unknown as Transport;
+      },
+      makeConversation: () => two,
+      pushEvent: () => {},
+      schedule: (_ms, cb) => {
+        void cb;
+        return 1;
+      },
+      cancel: () => {},
+      sealConversation: () => new Uint8Array(),
+      restoreConversation: () => two,
+      sasDigestHex: () => '00'.repeat(32),
+    };
+    const persistence: GroupPersistence = {
+      loadSelf: () => Promise.resolve(null),
+      saveSelf: () => Promise.resolve(),
+      resealSelf: () => {
+        reseals += 1;
+        return Promise.resolve(true);
+      },
+      recoverySeedHex: () => Promise.resolve(''),
+    };
+    const c = new GroupChannel(localDeps, () => Promise.resolve(), () => Promise.resolve(), persistence);
+    await c.connectGateway('ws://x/ws');
+    await c.startConversation([{ deviceKey: hx('bb'), keyPackage: new Uint8Array([7]) }]);
+    reseals = 0;
+
+    // Revoking mints a record naming the target key and seals it, so the exclusion survives a reload
+    // even if publishing the record to the control plane then fails.
+    const record = await c.revokeDeviceKey(SIBLING, 4);
+    expect(record).toBe(`rec-${SIBLING}`);
+    expect(two.minted).toEqual([{ key: SIBLING, seq: 4 }]);
+    expect(reseals).toBe(1);
+
+    // Now only the genuine record verifies. Everything else is DISCARDED, not stored: a hostile control
+    // plane must not be able to grow this list, and one bad entry must not poison the batch.
+    two.acceptable = new Set(['rec-good']);
+    reseals = 0;
+    const added = await c.ingestRevocations(['rec-forged', 'rec-good', 'rec-junk']);
+    expect(added).toBe(1);
+    expect(two.revoked.has('rec-good')).toBe(true);
+    expect(two.revoked.has('rec-forged')).toBe(false);
+    expect(reseals).toBe(1);
+
+    // Re-ingesting the same set is a no-op and does NOT re-seal: this runs on every sync, and a
+    // duplicate would also inflate the derived epoch (which is the record COUNT).
+    reseals = 0;
+    expect(await c.ingestRevocations(['rec-good'])).toBe(0);
+    expect(reseals).toBe(0);
+    expect(c.revocationState()).toEqual({ revoked: 2, floor: 2 });
   });
 
   it('persists a sibling device\'s message flagged ownAuthored, so this device keeps the revoke control', async () => {
@@ -812,6 +1033,251 @@ describe('GroupChannel', () => {
     expect(tx.published.filter((p) => p.routingKey === 'gmbox-0').length).toBeGreaterThanOrEqual(2);
   });
 
+  // ── TWO-DEVICE CONVERGENCE GATE ─────────────────────────────────────────────────────────────────
+  // The self-group split (2026-08-01) shipped because NOTHING at any layer asserted that two devices
+  // end up on the SAME self-group. The shared FakeConv returns the constant GID from BOTH createGroup
+  // and joinFromWelcome, and FakeTransport.publish only appends to an array, so the assertion in the
+  // formation test above ("the Welcome reached the sibling") holds even when the sibling joins nothing.
+  // These tests wire two real GroupChannels over one bus, give each mint a DISTINCT group id, and make
+  // the joiner derive its id from the Welcome BYTES — the property real MLS has — so a device that
+  // fails to join now fails the test.
+  class PairedConv extends FakeConv {
+    joinThrow: string | null = null; // models a wasm join rejection (e.g. NoMatchingKeyPackage)
+    mintedGid: string | null = null;
+    joinedGid: string | null = null;
+    constructor(sig: string, private readonly ownGid: string) {
+      super(sig, []);
+      this.selfConversation = true;
+    }
+    override createSelfGroup(): Uint8Array {
+      this.hasGroup = true;
+      this.mintedGid = this.ownGid;
+      this.members = [this.signaturePublicKeyHex(), 'sibling']; // founding roster: us + the welcomed device
+      const gid = hexToBytesTop(this.ownGid);
+      return encodeList([new Uint8Array([0x57, ...gid]), gid]); // the Welcome CARRIES the group id
+    }
+    override joinFromWelcome(welcome: Uint8Array): string {
+      if (this.joinThrow !== null) {
+        throw new Error(this.joinThrow);
+      }
+      this.hasGroup = true;
+      this.members = [this.signaturePublicKeyHex(), 'minter']; // we joined a group that already had the minter
+      this.joinedGid = bytesToHex(welcome.slice(1));
+      return this.joinedGid;
+    }
+    override listConversations(): string[] {
+      return [this.mintedGid, this.joinedGid].filter((g): g is string => g !== null);
+    }
+    override groupMailbox(id: string): string {
+      return `gmbox-${id}`;
+    }
+    // Route a received frame to whichever group THIS device actually holds, instead of the file-wide
+    // constant GID — otherwise a two-device exchange "receives" into a conversation neither device has.
+    override receive(ct: Uint8Array): Uint8Array {
+      const gid = this.joinedGid ?? this.mintedGid;
+      if (gid === null) {
+        throw new Error('no group');
+      }
+      return encodeList([hexToBytesTop(gid), this.receiveBlob(ct)]);
+    }
+  }
+
+  interface Dev {
+    conv: PairedConv;
+    ch: GroupChannel;
+    handlers: TransportHandlers;
+    subscribed: Set<string>;
+    outbox: PendingWelcome[];
+  }
+
+  // A hold-until-ack bus shared by both devices, mirroring gateway/internal/bus: a blob is delivered to
+  // every subscriber of its routing key and stays queued until it is ACKED (so an unacked Welcome is
+  // redelivered on the next flush, exactly as a re-subscribe would).
+  function makeBus(): { devs: Dev[]; queue: EnvelopeMsg[]; acked: Set<string>; flush: () => void } {
+    const devs: Dev[] = [];
+    const queue: EnvelopeMsg[] = [];
+    const acked = new Set<string>();
+    const flush = (): void => {
+      for (const env of [...queue]) {
+        for (const d of devs) {
+          if (d.subscribed.has(env.routingKey)) {
+            d.handlers.onDeliver(env);
+          }
+        }
+      }
+      for (let i = queue.length - 1; i >= 0; i--) {
+        const q = queue[i];
+        if (q !== undefined && acked.has(bytesToHex(q.messageId))) {
+          queue.splice(i, 1);
+        }
+      }
+    };
+    return { devs, queue, acked, flush };
+  }
+
+  function addDevice(bus: ReturnType<typeof makeBus>, sig: string, gid: string): Dev {
+    const pconv = new PairedConv(sig, gid);
+    const subscribed = new Set<string>();
+    let captured: TransportHandlers;
+    const transport = {
+      setConsumerIdResolver: () => {},
+      subscribe: (k: string) => subscribed.add(k),
+      publish: (e: EnvelopeMsg) => queuePush(e),
+      ack: (id: Uint8Array) => bus.acked.add(bytesToHex(id)),
+      sendOffer: () => {},
+      sendAccept: () => {},
+      takePending: () => [],
+      close: () => {},
+    };
+    const queuePush = (e: EnvelopeMsg): void => {
+      bus.queue.push(e);
+    };
+    const deps: GroupDeps = {
+      connect: (_url, h) => {
+        captured = h;
+        return transport as unknown as Transport;
+      },
+      makeConversation: () => pconv,
+      pushEvent: () => {},
+      schedule: () => 1,
+      cancel: () => {},
+      sealConversation: () => new Uint8Array(),
+      restoreConversation: () => pconv,
+      sasDigestHex: () => '00'.repeat(32),
+    };
+    // A durable, device-local outbox store (the real one seals under the MSK in IndexedDB).
+    let outbox: PendingWelcome[] = [];
+    const persistence: GroupPersistence = {
+      loadSelf: () => Promise.resolve(null),
+      saveSelf: () => Promise.resolve(),
+      resealSelf: () => Promise.resolve(true),
+      recoverySeedHex: () => Promise.resolve(''),
+      loadWelcomeOutbox: () => Promise.resolve([...outbox]),
+      saveWelcomeOutbox: (e) => {
+        outbox = [...e];
+        return Promise.resolve();
+      },
+    };
+    const channel = new GroupChannel(deps, () => Promise.resolve(), () => Promise.resolve(), persistence);
+    const dev: Dev = {
+      conv: pconv,
+      ch: channel,
+      get handlers(): TransportHandlers {
+        return captured;
+      },
+      subscribed,
+      get outbox(): PendingWelcome[] {
+        return outbox;
+      },
+    } as Dev;
+    bus.devs.push(dev);
+    return dev;
+  }
+
+  it('TWO DEVICES CONVERGE: the sibling joins the minter self-group and both report the SAME id', async () => {
+    const bus = makeBus();
+    const phone = addDevice(bus, hx('d7'), '9a86'); // the designated minter (lowest device key)
+    const laptop = addDevice(bus, hx('fc'), '2e44'); // defers, joins via the Welcome
+    await phone.ch.connectGateway('ws://x/ws');
+    await laptop.ch.connectGateway('ws://x/ws');
+
+    await phone.ch.createSelfGroup([{ deviceKey: hx('fc'), keyPackage: new Uint8Array([7]) }]);
+    bus.flush();
+    await new Promise((r) => setTimeout(r, 0));
+
+    // THE assertion the old suite never made. Without it, a laptop sitting on its own self-group and a
+    // phone sitting on another both look "healthy" to every other test in this file.
+    expect(laptop.ch.selfConversationId()).toBe(phone.ch.selfConversationId());
+    expect(laptop.ch.selfConversationId()).toBe('c-9a86'); // and it is the MINTER's group, not a second one
+    expect(laptop.conv.mintedGid).toBeNull(); // the joiner never minted a competing group
+  });
+
+  it('a self-group Welcome whose join FAILS is not acked away, and converges once the join can succeed', async () => {
+    // Fix C. The bare `catch { ack(); return; }` acked a failed join, and an ack destroys the only copy
+    // on a hold-until-ack bus — one transient failure split the account permanently and silently.
+    const bus = makeBus();
+    const phone = addDevice(bus, hx('d7'), '9a86');
+    const laptop = addDevice(bus, hx('fc'), '2e44');
+    await phone.ch.connectGateway('ws://x/ws');
+    await laptop.ch.connectGateway('ws://x/ws');
+    laptop.conv.joinThrow = 'process welcome: NoMatchingKeyPackage';
+
+    await phone.ch.createSelfGroup([{ deviceKey: hx('fc'), keyPackage: new Uint8Array([7]) }]);
+    bus.flush();
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(laptop.ch.selfConversationId()).toBeNull(); // the join failed
+    expect(bus.acked.size).toBe(0); // ...and the Welcome was NOT destroyed
+    expect(bus.queue.length).toBe(1); // it is still queued for redelivery
+
+    laptop.conv.joinThrow = null; // the sender re-sealed a fresh package / the vault unlocked
+    bus.flush();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(laptop.ch.selfConversationId()).toBe(phone.ch.selfConversationId()); // self-healed
+  });
+
+  it('the on-screen diagnostic distinguishes a converged pair from a device whose join was REJECTED', async () => {
+    // The phone has no usable console and device-local MLS state is invisible to the keyless gateway,
+    // so this line IS the instrument. Roster size answers what the group id alone cannot — which device
+    // minted — and W<seen>/<joined> says what an arriving Welcome actually did.
+    const ok = makeBus();
+    const phoneOk = addDevice(ok, hx('d7'), '9a86');
+    const laptopOk = addDevice(ok, hx('fc'), '2e44');
+    await phoneOk.ch.connectGateway('ws://x/ws');
+    await laptopOk.ch.connectGateway('ws://x/ws');
+    await phoneOk.ch.createSelfGroup([{ deviceKey: hx('fc'), keyPackage: new Uint8Array([7]) }]);
+    ok.flush();
+    await new Promise((r) => setTimeout(r, 0));
+    // A healthy pair: BOTH sides report a populated group, and the joiner logs a Welcome it consumed.
+    expect(phoneOk.ch.selfGroupDiagnostic()).toBe('2 devices · W0/0'); // the minter saw no Welcome
+    expect(laptopOk.ch.selfGroupDiagnostic()).toBe('2 devices · W1/1'); // the joiner saw one and used it
+
+    const bad = makeBus();
+    const phoneBad = addDevice(bad, hx('d7'), '9a86');
+    const laptopBad = addDevice(bad, hx('fc'), '2e44');
+    await phoneBad.ch.connectGateway('ws://x/ws');
+    await laptopBad.ch.connectGateway('ws://x/ws');
+    laptopBad.conv.joinThrow = 'process welcome: WelcomeError(NoMatchingKeyPackage)';
+    await phoneBad.ch.createSelfGroup([{ deviceKey: hx('fc'), keyPackage: new Uint8Array([7]) }]);
+    bad.flush();
+    await new Promise((r) => setTimeout(r, 0));
+    // The split, legible on the device: a Welcome arrived, produced nothing, and named its own cause.
+    expect(laptopBad.ch.selfGroupDiagnostic()).toBe('W1/0 · NoMatchingKeyPackage');
+  });
+
+  it('a founding Welcome DESTROYED by a gateway restart is re-published from the durable outbox', async () => {
+    // The durability requirement. gateway/internal/bus holds undelivered blobs in a plain in-process
+    // map and clamps the TTL to 24h, and the unit has no queue hand-off, so any restart silently
+    // vaporises a Welcome in flight. The gateway is deliberately amnesiac (nothing at rest, threat
+    // model unchanged), so the SENDER has to be the durable party.
+    const bus = makeBus();
+    const phone = addDevice(bus, hx('d7'), '9a86');
+    const laptop = addDevice(bus, hx('fc'), '2e44');
+    await phone.ch.connectGateway('ws://x/ws');
+    await laptop.ch.connectGateway('ws://x/ws');
+
+    await phone.ch.createSelfGroup([{ deviceKey: hx('fc'), keyPackage: new Uint8Array([7]) }]);
+    expect(phone.outbox).toHaveLength(1); // the sender kept its own copy
+
+    bus.queue.length = 0; // ── the gateway restarts: every held blob is gone, nobody is told ──
+    bus.flush();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(laptop.ch.selfConversationId()).toBeNull(); // the Welcome really was lost
+
+    await phone.ch.connectGateway('ws://x/ws'); // the phone reconnects to the fresh gateway
+    bus.flush();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(laptop.ch.selfConversationId()).toBe(phone.ch.selfConversationId()); // recovered
+
+    // And the entry retires on PROOF the sibling is live (a frame we did not author), not on roster
+    // membership — the roster is asserted unilaterally by the adder and is what made the split invisible.
+    const cid = laptop.ch.selfConversationId();
+    await laptop.ch.sendMessage(cid as string, 'hello from the sibling');
+    bus.flush();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(phone.outbox).toHaveLength(0);
+  });
+
   it('syncBuddies publishes the buddy list ONLY to the self-group, never to a peer conversation', async () => {
     await ch.connectGateway('ws://x/ws');
     // A normal (peer) conversation: not a self-group.
@@ -826,6 +1292,81 @@ describe('GroupChannel', () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(tx.published).toHaveLength(0);
+  });
+
+  it('a reconnect RE-PUBLISHES the contact graph into the self-group, so a sibling that missed a one-time frame converges', async () => {
+    // SG2 convergence. When the laptop first added the phone, the phone's certificate had not settled,
+    // so the phone RECEIVED the buddy frame, saw it as not-from-our-account, dropped it, and acked it off
+    // the bus. The frame is gone. Without a re-publish the phone waits for a buddy-list EDIT that may
+    // never happen. On every reconnect we re-publish into the canonical self-group (idempotent CRDT), so
+    // any device that missed an earlier one-time publish converges on the next reconnect of ANY member.
+    await ch.connectGateway('ws://x/ws');
+    conv.selfConversation = true;
+    await ch.openSelfConversation(); // a self-group now exists and is restored on reconnect
+    buddiesFrame = new TextEncoder().encode(JSON.stringify({ buddies: { raven: { addedAt: 1, v: 9, removed: false } } }));
+    tx.published = [];
+    await ch.connectGateway('ws://x/ws'); // reconnect
+    await Promise.resolve();
+    await Promise.resolve(); // let the async resync publishes land
+    // Identity AND buddy list AND group list rode the self-group mailbox on reconnect.
+    expect(tx.published.filter((p) => p.routingKey === 'gmbox-0').length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('the reconnect resync NEVER publishes the contact graph when the only conversation is a peer roster', async () => {
+    // The load-bearing privacy guard: the resync is self-group-gated. A device whose only conversation is
+    // with a PEER must publish NOTHING on reconnect, or its buddy list would ride a roster the peer reads.
+    await ch.connectGateway('ws://x/ws');
+    conv.selfConversation = false; // a peer conversation, never a self-group
+    await ch.startConversation([{ deviceKey: hx('bb'), keyPackage: new Uint8Array([7]) }]);
+    await Promise.resolve();
+    await Promise.resolve();
+    buddiesFrame = new TextEncoder().encode(JSON.stringify({ buddies: { raven: { addedAt: 1, v: 9, removed: false } } }));
+    tx.published = [];
+    await ch.connectGateway('ws://x/ws'); // reconnect
+    await Promise.resolve();
+    await Promise.resolve();
+    // No buddy/group/identity frame on the peer's group mailbox: the resync found no self-group and did nothing.
+    expect(tx.published.some((p) => p.routingKey === 'gmbox-0')).toBe(false);
+  });
+
+  it('a POPULATED self-group outranks a certified SOLO one, so a replacement mint cannot strand a device', async () => {
+    // Notes stopped crossing devices: each device had minted a certified SOLO replacement self-group and
+    // canonical selection preferred it (strict ranked ahead of population), orphaning the real shared
+    // group. A solo self-group has nobody to deliver to, so it must never outrank a populated one, and
+    // a populated group must SUFFICE (never trigger the replacement mint that creates the orphan).
+    await ch.connectGateway('ws://x/ws');
+    conv.selfConversation = true;
+    conv.strictSelf = false; // the shared group classifies lenient-only (our frozen certless own leaf)
+    conv.members = [SELF, SIBLING]; // ...but it HAS a sibling: it actually syncs
+    await ch.startConversation([{ deviceKey: hx('bb'), keyPackage: new Uint8Array([7]) }]);
+    await Promise.resolve();
+    // A populated self-group suffices: no certified-solo replacement is minted over it.
+    expect(ch.hasSelfGroup()).toBe(true);
+  });
+
+  it('SG2 self-heal: a DEAD self-group is abandoned and unsubscribed, a LIVE one is never touched', async () => {
+    // A self-group poisoned by a frozen certless leaf can never be repaired in place and never syncs. It
+    // used to sit forever while the user closed it by hand on every device. The heal abandons it so a
+    // clean one can form — but it must NEVER touch a working self-group, which is the property that
+    // makes this safe to run automatically.
+    await ch.connectGateway('ws://x/ws');
+    conv.selfConversation = true;
+    const id = await ch.openSelfConversation();
+
+    // LIVE self-group: the crypto layer refuses, and the session stays put.
+    expect(await ch.abandonDeadSelfGroup(id, true)).toBe(false);
+    expect(conv.abandoned).toHaveLength(0);
+    expect(ch.selfConversationId()).toBe(id); // still ours, still open
+
+    // Not recorded as self: refused too (this is what protects a pending peer chat).
+    conv.unlinkedGroups.add(GID);
+    expect(await ch.abandonDeadSelfGroup(id, false)).toBe(false);
+    expect(conv.abandoned).toHaveLength(0);
+
+    // DEAD and recorded: abandoned, and the local session + subscription go with it.
+    expect(await ch.abandonDeadSelfGroup(id, true)).toBe(true);
+    expect(conv.abandoned).toEqual([GID]);
+    expect(ch.selfConversationId()).toBeNull(); // no self-group held any more: a clean one can form
   });
 
   it('joins a self-group Welcome SILENTLY: subscribes and syncs buddies but never surfaces a conversation', async () => {
@@ -873,7 +1414,7 @@ describe('GroupChannel', () => {
     expect(connEvents).not.toContain('live'); // never the perpetual-SECURING state when a session exists
   });
 
-  it('a staged add that survived a reload is re-published and re-armed, and its backstop converges it', async () => {
+  it('a staged add that survived a reload is re-published and re-armed, and its backstop abandons it', async () => {
     // Simulate a reload with a commit in flight: the restored conversation reports a persisted pending
     // Add (Batch B). connectGateway must re-publish the EXACT wire bytes (commit to the group mailbox,
     // Welcome to the added device), mark pendingOps (so reconcile cannot re-stage a forking duplicate),
@@ -892,11 +1433,14 @@ describe('GroupChannel', () => {
     const before = tx.published.length;
     await ch.reconcileSiblings([SELF, target], [{ deviceKey: target, keyPackage: hexToBytesTop(target) }]);
     expect(tx.published.length).toBe(before); // pendingOps bail: no second, forking commit
-    // No echo arrives: the post-restore backstop confirms the SAME commit and the roster converges.
+    // No echo arrives. The re-armed backstop is still only a wall clock, so it abandons the staged
+    // commit rather than merging it: the device stays on the epoch its peers are on, and the stalled
+    // membership change is reported instead of being silently claimed as done.
     expect(scheduled.length).toBeGreaterThan(0);
     scheduled.forEach((cb) => cb());
-    expect(conv.roster()).toContain(target);
-    expect(events.some((e) => e.kind === 'roster-changed')).toBe(true);
+    expect(conv.roster()).not.toContain(target);
+    expect(events.some((e) => e.kind === 'roster-changed')).toBe(false);
+    expect(events.some((e) => e.kind === 'membership-stalled')).toBe(true);
   });
 
   it('openSelfConversation refuses on a cert-only device (no account key) instead of minting an unrecognized group', async () => {
@@ -924,6 +1468,10 @@ describe('GroupChannel', () => {
   it('a seed-holder whose best self-group is lenient-only mints a certified replacement', async () => {
     await ch.connectGateway('ws://x/ws');
     conv.selfConversation = true;
+    // openSelfConversation mints a SOLO group; model that roster explicitly. The certified-replacement
+    // mint is only for a solo/degraded copy: a POPULATED lenient self-group suffices and must never be
+    // replaced (replacing it strands this device alone and notes stop crossing devices).
+    conv.members = [SELF];
     await ch.openSelfConversation(); // the only self-group held (strict by default: healthy)
     expect(conv.createSelfCalls).toBe(1);
     expect(ch.hasSelfGroup()).toBe(true); // a certified best suffices
@@ -969,10 +1517,10 @@ describe('GroupChannel', () => {
   it('the mint guard re-certifies an uncertified seed-holder before minting key packages', async () => {
     await ch.connectGateway('ws://x/ws');
     conv.credentialCertifiedFlag = false; // legacy label-only credential on a seed-holder
-    ch.freshKeyPackages(3);
+    await ch.freshKeyPackages(3);
     expect(conv.reauthorized).toBe(1); // re-certified once, BEFORE the packages were minted
     conv.credentialCertifiedFlag = true;
-    ch.freshKeyPackages(3);
+    await ch.freshKeyPackages(3);
     expect(conv.reauthorized).toBe(1); // a certified credential mints without touching the cert
   });
 
@@ -1201,16 +1749,19 @@ describe('GroupChannel', () => {
     conv.stageAddThrow = null;
   });
 
-  it('self-heal: the confirm backstop merges an uncontested add when no echo arrives', async () => {
+  it('the backstop ABANDONS an unechoed add rather than merging it onto a private key period', async () => {
     await ch.connectGateway('ws://x/ws');
     await ch.startConversation([{ deviceKey: hx('bb'), keyPackage: new Uint8Array([7]) }]);
     await ch.reconcileSiblings([SELF, SIBLING], candidates);
     expect(conv.roster()).not.toContain(SIBLING); // staged, awaiting confirmation
-    // No echo is delivered; fire the scheduled backstop timer instead.
+    // No echo arrives, so nothing proves any other member received this commit. Merging here used to
+    // advance this device alone onto a key period nobody else was on, which is unrecoverable and
+    // silent. The timer now abandons the staged commit and says so.
     expect(scheduled.length).toBeGreaterThan(0);
     scheduled.forEach((cb) => cb());
-    expect(conv.roster()).toContain(SIBLING); // confirmed via the backstop
-    expect(events.some((e) => e.kind === 'roster-changed')).toBe(true);
+    expect(conv.roster()).not.toContain(SIBLING); // still on the epoch everyone else is on
+    expect(events.some((e) => e.kind === 'roster-changed')).toBe(false); // no false membership claim
+    expect(events.some((e) => e.kind === 'membership-stalled')).toBe(true);
   });
 
   it('connectGateway resolves a secret-keyed per-mailbox delivery-cursor tag for each subscribe', async () => {

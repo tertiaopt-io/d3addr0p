@@ -93,8 +93,18 @@ export class LifetimeManager {
   /**
    * Start the countdown for an unarmed duration message the recipient has now viewed (hold-until-
    * seen). Idempotent: a no-op if the message is missing, already armed, read, or not a duration.
+   *
+   * Pass `known` when the caller already holds the record. openChannel does, for every message in the
+   * conversation, and it runs on every send and every inbound message, so re-fetching each one cost a
+   * fresh IndexedDB transaction per message for a value already in memory (measured at 1000 messages:
+   * 86ms of 196ms, 44% of the call). The copy is used for the CHECK only. That is safe in the one
+   * direction that matters: arming is one-way, so a copy that reads armed cannot be a stale "unarmed",
+   * and anything that actually needs a write re-reads the authoritative record below first.
    */
-  async armOnView(messageId: string): Promise<void> {
+  async armOnView(messageId: string, known?: VaultRecord): Promise<void> {
+    if (known !== undefined && (known.expiresAtMs !== null || known.lifetimeKind !== 'duration')) {
+      return;
+    }
     const record = await this.store.get(messageId);
     if (record === undefined || record.expiresAtMs !== null || record.lifetimeKind !== 'duration') {
       return;

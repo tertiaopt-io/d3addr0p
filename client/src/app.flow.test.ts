@@ -136,6 +136,26 @@ class FakeController implements AppController {
   certEpoch(): Promise<number> {
     return Promise.resolve(0);
   }
+  // ADR-022 P7 denylist.
+  mintedRevocations: Array<{ key: string; seq: number }> = [];
+  ingested: string[] = [];
+  revokeMintFails = false;
+  revokeDeviceKey(deviceSigKeyHex: string, issuedSeq: number): Promise<string | null> {
+    if (this.revokeMintFails) {
+      return Promise.reject(new Error('no account key'));
+    }
+    this.mintedRevocations.push({ key: deviceSigKeyHex, seq: issuedSeq });
+    return Promise.resolve(`rec-${deviceSigKeyHex}`);
+  }
+  ingestRevocations(records: readonly string[]): Promise<number> {
+    this.ingested.push(...records);
+    return Promise.resolve(records.length);
+  }
+  revocationState(): Promise<{ revoked: number; floor: number }> {
+    return Promise.resolve({ revoked: this.mintedRevocations.length, floor: this.mintedRevocations.length });
+  }
+  // Overridden per-test to model the crypto layer's own dedupe (a key already covered is not re-minted).
+  isDeviceRevoked: (deviceSigKeyHex: string) => Promise<boolean> = () => Promise.resolve(false);
 
   unlock(u: string, p: string): Promise<{ ok: boolean; created?: boolean; error?: string }> {
     this.unlocks.push({ u, p });
@@ -207,6 +227,18 @@ class FakeController implements AppController {
   connectGateway(): Promise<{ ok: boolean; selfContact: string }> {
     this.connects++;
     return Promise.resolve({ ok: true, selfContact: SELF_CONTACT });
+  }
+  // Hidden self-group formation (SG1). selfGroupExists models whether a self-group is present; mints
+  // records every ensureSelfGroup call so a test can assert WHO minted and how often.
+  selfGroupExists = false;
+  mints: Array<readonly DeviceTarget[]> = [];
+  hasSelfGroup(): Promise<boolean> {
+    return Promise.resolve(this.selfGroupExists);
+  }
+  ensureSelfGroup(targets: readonly DeviceTarget[]): Promise<void> {
+    this.mints.push(targets);
+    this.selfGroupExists = true;
+    return Promise.resolve();
   }
   startConversation(targets: readonly DeviceTarget[]): Promise<TransmitModel> {
     this.lastTargets = targets;
@@ -288,6 +320,10 @@ function fakeTransport(
   // current, non-revoked device, so the fail-closed revocation check in doLogin reads 'clear'. Per-test
   // responses override these (e.g. to model a revoked device, a multi-device account, or a 5xx failure).
   const defaults: Record<string, { status: number; body?: Record<string, unknown> }> = {
+    // A deployment WITHOUT the proof-of-work endpoint answers 404 there and registration proceeds
+    // without a proof. The catch-all 500 below means "server fault", which registration now surfaces
+    // as a server problem rather than silently sending a proofless request that is certain to fail.
+    '/api/challenge': { status: 404 },
     '/api/add-device': { status: 200, body: { deviceId: 'd1' } },
     '/api/list-devices': { status: 200, body: { devices: [device({ deviceId: 'd1', deviceKey: SIG, current: true })] } },
   };
@@ -388,6 +424,49 @@ describe('register flow', () => {
     expect(ctl.discarded).toEqual([]); // success: no rollback
     const reg = t.calls.find((c) => c.path === '/api/register');
     expect(reg?.body['identityKey']).toBe(SIG); // the directory entry is our signature key
+  });
+
+  it('ignores a second submit, so a double click cannot erase the account it just created', async () => {
+    // The defect: doRegister had no in-flight guard, so a second click ran a second concurrent
+    // registration. One POST got 201 and the other 409, and the 409 branch called discardAccount, which
+    // crypto-erased the vault and account seed of the account that had JUST been created on the server.
+    // The user was left with a live account whose keys existed nowhere. The proof of work makes a double
+    // click MORE likely, by putting a visible pause between the click and any feedback.
+    let registers = 0;
+    const t: AccountTransport & { calls: Array<{ path: string; body: Record<string, unknown> }> } = {
+      calls: [],
+      send(path, body) {
+        t.calls.push({ path, body });
+        if (path === '/api/register') {
+          registers += 1;
+          return Promise.resolve(registers === 1
+            ? { status: 201, body: { token: 'tok' } }
+            : { status: 409, body: { error: 'username_taken' } });
+        }
+        if (path === '/api/challenge') {
+          return Promise.resolve({ status: 404, body: {} });
+        }
+        if (path === '/api/add-device') {
+          return Promise.resolve({ status: 200, body: { deviceId: 'd1' } });
+        }
+        if (path === '/api/list-devices') {
+          return Promise.resolve({ status: 200, body: { devices: [device({ deviceId: 'd1', deviceKey: SIG, current: true })] } });
+        }
+        return Promise.resolve({ status: 500, body: {} });
+      },
+    };
+    const { root, ctl } = setup(new AccountClient(t));
+
+    click(root, '[data-action="to-register"]');
+    fill(root, '#dd-user', 'alice');
+    fill(root, '#dd-pass', 'hunter2');
+    fill(root, '#dd-pass2', 'hunter2');
+    submitForm(root);
+    submitForm(root); // the second click, before the first has finished
+
+    await waitFor(() => root.querySelector('.dd-blhead') !== null);
+    expect(registers).toBe(1); // only ONE registration ever left the client
+    expect(ctl.discarded).toEqual([]); // and the created account's keys were never destroyed
   });
 
   it('rejects a taken username and rolls back the local vault', async () => {
@@ -816,6 +895,265 @@ describe('device management', () => {
     await waitFor(() => calls.some((c) => c.path === '/api/revoke-device'));
     expect(calls.find((c) => c.path === '/api/revoke-device')?.body['deviceId']).toBe('d2');
     expect(revoked).toBe(true);
+  });
+
+  it('arming a revoke keeps FOCUS on that device\'s confirm button so the second click cannot miss', async () => {
+    // The repaint that inserts the inline confirm strip used to reset the list to the top, so the row
+    // under the pointer silently became a DIFFERENT device and the confirm click nearly revoked the
+    // wrong one (it happened live: the user almost revoked their laptop instead of their phone).
+    // Anchoring on a scroll OFFSET proved fragile (parked windows mean several .dd-form elements, and
+    // the first is not the live one), so the contract is now about the ELEMENT: after arming, focus is
+    // ON the confirm button for the armed device.
+    const transport = fakeTransport({
+      '/api/login': { status: 200, body: { token: 'tok' } },
+      '/api/add-device': { status: 200, body: { deviceId: 'd1' } },
+      '/api/list-devices': {
+        status: 200,
+        body: {
+          devices: [
+            device({ deviceId: 'd1', deviceKey: SIG, current: true }),
+            device({ deviceId: 'd2', deviceKey: 'e'.repeat(64) }),
+            device({ deviceId: 'd3', deviceKey: 'f'.repeat(64) }),
+          ],
+        },
+      },
+    });
+    const { root } = setup(new AccountClient(transport));
+    fill(root, '#dd-user', 'alice');
+    fill(root, '#dd-pass', 'pw');
+    submitForm(root);
+    await waitFor(() => root.querySelector('.dd-blhead') !== null);
+    openDeviceKeys(root);
+    await waitFor(() => root.innerHTML.includes('THIS DEVICE'));
+
+    click(root, '[data-action="revoke-device"][data-device="d3"]');
+    await waitFor(() => root.innerHTML.includes('Revoke this device?'));
+
+    const confirm = root.querySelector('[data-action="revoke-confirm"][data-device="d3"]');
+    expect(confirm).not.toBeNull();
+    expect(document.activeElement).toBe(confirm);
+  });
+
+  it('a revoke mints the P7 record for that device key and sends it with the call', async () => {
+    // The server-side burn only stops the device signing in. A device that still holds the account seed
+    // re-certifies itself above any epoch floor and rejoins every group, so the SIGNED RECORD naming its
+    // key has to be minted here (while this device holds the account key) and reach the wire.
+    const calls: Array<{ path: string; body: Record<string, unknown> }> = [];
+    const otherKey = 'e'.repeat(64);
+    const transport: AccountTransport = {
+      send(path, body) {
+        calls.push({ path, body });
+        if (path === '/api/login') {
+          return Promise.resolve({ status: 200, body: { token: 'tok' } });
+        }
+        if (path === '/api/add-device') {
+          return Promise.resolve({ status: 200, body: { deviceId: 'd1' } });
+        }
+        if (path === '/api/revoke-device') {
+          return Promise.resolve({ status: 200, body: { ok: true, recordStored: true } });
+        }
+        if (path === '/api/list-devices') {
+          return Promise.resolve({
+            status: 200,
+            body: {
+              devices: [
+                device({ deviceId: 'd1', deviceKey: SIG, current: true }),
+                device({ deviceId: 'd2', deviceKey: otherKey }),
+              ],
+              accountEpoch: 2,
+              revocations: ['ab'.repeat(140)],
+            },
+          });
+        }
+        return Promise.resolve({ status: 500, body: {} });
+      },
+    };
+    const { root, ctl } = setup(new AccountClient(transport));
+    fill(root, '#dd-user', 'alice');
+    fill(root, '#dd-pass', 'pw');
+    submitForm(root);
+    await waitFor(() => root.querySelector('.dd-blhead') !== null);
+    openDeviceKeys(root);
+    await waitFor(() => root.innerHTML.includes('THIS DEVICE'));
+
+    click(root, '[data-action="revoke-device"][data-device="d2"]');
+    await waitFor(() => root.innerHTML.includes('Revoke this device?'));
+    click(root, '[data-action="revoke-confirm"]');
+    await waitFor(() => calls.some((c) => c.path === '/api/revoke-device'));
+
+    // Minted for the TARGET's signature key, and carried on the same call that burns the row.
+    expect(ctl.mintedRevocations.map((m) => m.key)).toEqual([otherKey]);
+    expect(calls.find((c) => c.path === '/api/revoke-device')?.body['record']).toBe(`rec-${otherKey}`);
+    // And the records the server already holds were ingested, so this device's denylist is current
+    // before it certifies anything.
+    await waitFor(() => ctl.ingested.includes('ab'.repeat(140)));
+  });
+
+  it('SG1: a non-designated device DEFERS to the minter, then mints itself once the grace window passes', async () => {
+    // The election used to be absolute: only the lowest-keyed device ever minted the self-group. If that
+    // device could not mint (a cert-only phone cannot anchor a solo group), NO device formed it and the
+    // account sat with two healthy devices and no self-group FOREVER — observed live (no formation for 19
+    // hours, both devices online, so nothing synced). The fallback keeps the single-minter behavior for
+    // one grace window, then lets a device that CAN mint do it.
+    const LOWER = '0'.repeat(64); // sorts BELOW our SIG ('a'*64), so the SIBLING is the designated minter
+    const transport = fakeTransport({
+      '/api/login': { status: 200, body: { token: 'tok' } },
+      '/api/add-device': { status: 200, body: { deviceId: 'd1' } },
+      '/api/publish-keys': { status: 201 },
+      '/api/list-devices': {
+        status: 200,
+        body: {
+          devices: [
+            device({ deviceId: 'd1', deviceKey: SIG, current: true }),
+            device({ deviceId: 'd2', deviceKey: LOWER }),
+          ],
+        },
+      },
+      '/api/take-keys': {
+        status: 200,
+        body: { devices: [{ deviceKey: LOWER, keyPackage: 'abcd', lastResort: false }] },
+      },
+    });
+    const ctl = new FakeController();
+    const { root } = setup(new AccountClient(transport), ctl);
+    fill(root, '#dd-user', 'alice');
+    fill(root, '#dd-pass', 'pw');
+    submitForm(root);
+    await waitFor(() => root.querySelector('.dd-blhead') !== null);
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Inside the grace window this device DEFERS: the designated (lower-keyed) sibling owns the mint.
+    expect(ctl.mints).toHaveLength(0);
+
+    // Past the window, with the designated device having still produced nothing, this device mints so the
+    // account is not stranded without a self-group. Advance only Date.now (the window is a wall-clock
+    // comparison); real timers keep the app's async chain running normally.
+    const realNow = Date.now;
+    const skewed = realNow() + 60000;
+    vi.spyOn(Date, 'now').mockImplementation(() => skewed);
+    try {
+      document.dispatchEvent(new Event('visibilitychange')); // any later trigger re-runs ensureSelfGroup
+      await waitFor(() => ctl.mints.length === 1);
+      expect(ctl.mints[0]?.[0]?.deviceKey).toBe(LOWER); // it added the sibling
+    } finally {
+      vi.mocked(Date.now).mockRestore();
+    }
+  });
+
+  it('backfills P7 records for devices revoked before records existed, once each', async () => {
+    // The migration. An account that has been revoking devices since before P7 has burned server rows
+    // and no records, so those devices are held out only by the epoch floor, which a seed-holder walks
+    // straight over. Any device holding the account key mints the missing records on its first look at
+    // the device list. It must mint ONE per device: a second, differently-sequenced record for the same
+    // target would be equally valid and would inflate the derived epoch.
+    const calls: Array<{ path: string; body: Record<string, unknown> }> = [];
+    const goneKey = 'a'.repeat(64);
+    const alsoGoneKey = 'b'.repeat(64);
+    const transport: AccountTransport = {
+      send(path, body) {
+        calls.push({ path, body });
+        if (path === '/api/login') {
+          return Promise.resolve({ status: 200, body: { token: 'tok' } });
+        }
+        if (path === '/api/add-device') {
+          return Promise.resolve({ status: 200, body: { deviceId: 'd1' } });
+        }
+        if (path === '/api/revoke-device') {
+          return Promise.resolve({ status: 200, body: { ok: true, recordStored: true } });
+        }
+        if (path === '/api/list-devices') {
+          return Promise.resolve({
+            status: 200,
+            body: {
+              devices: [
+                device({ deviceId: 'd1', deviceKey: SIG, current: true }),
+                device({ deviceId: 'old1', deviceKey: goneKey, revoked: true }),
+                device({ deviceId: 'old2', deviceKey: alsoGoneKey, revoked: true }),
+              ],
+              accountEpoch: 15, // far above the two tombstones: history was pruned, the counter was not
+            },
+          });
+        }
+        return Promise.resolve({ status: 500, body: {} });
+      },
+    };
+    const ctl = new FakeController();
+    // Model the crypto layer's own dedupe: a key we already hold a record for is not minted again.
+    const held = new Set<string>();
+    ctl.revokeDeviceKey = (key: string, seq: number): Promise<string | null> => {
+      ctl.mintedRevocations.push({ key, seq });
+      held.add(key);
+      return Promise.resolve(`rec-${key}`);
+    };
+    ctl.isDeviceRevoked = (key: string): Promise<boolean> => Promise.resolve(held.has(key));
+
+    const { root } = setup(new AccountClient(transport), ctl);
+    fill(root, '#dd-user', 'alice');
+    fill(root, '#dd-pass', 'pw');
+    submitForm(root);
+    await waitFor(() => root.querySelector('.dd-blhead') !== null);
+    await waitFor(() => ctl.mintedRevocations.length === 2);
+
+    // One record per revoked device, and none for the live one.
+    expect(ctl.mintedRevocations.map((m) => m.key).sort()).toEqual([goneKey, alsoGoneKey].sort());
+    const posted = calls.filter((c) => c.path === '/api/revoke-device').map((c) => c.body['record']);
+    expect(posted.sort()).toEqual([`rec-${goneKey}`, `rec-${alsoGoneKey}`].sort());
+
+    // A later pass over the same list mints nothing more.
+    const before = ctl.mintedRevocations.length;
+    openDeviceKeys(root);
+    await waitFor(() => root.innerHTML.includes('THIS DEVICE'));
+    expect(ctl.mintedRevocations.length).toBe(before);
+  });
+
+  it('a revoke still burns the server row when this device cannot sign a record', async () => {
+    // A cert-only device holds no account key, so it cannot author the record. It must still be able to
+    // revoke: losing the server-side burn too would leave the user with no way to cut a lost device off.
+    const calls: Array<{ path: string; body: Record<string, unknown> }> = [];
+    const transport: AccountTransport = {
+      send(path, body) {
+        calls.push({ path, body });
+        if (path === '/api/login') {
+          return Promise.resolve({ status: 200, body: { token: 'tok' } });
+        }
+        if (path === '/api/add-device') {
+          return Promise.resolve({ status: 200, body: { deviceId: 'd1' } });
+        }
+        if (path === '/api/revoke-device') {
+          return Promise.resolve({ status: 200, body: { ok: true, recordStored: false } });
+        }
+        if (path === '/api/list-devices') {
+          return Promise.resolve({
+            status: 200,
+            body: {
+              devices: [
+                device({ deviceId: 'd1', deviceKey: SIG, current: true }),
+                device({ deviceId: 'd2', deviceKey: 'e'.repeat(64) }),
+              ],
+            },
+          });
+        }
+        return Promise.resolve({ status: 500, body: {} });
+      },
+    };
+    const ctl = new FakeController();
+    ctl.revokeMintFails = true;
+    const { root } = setup(new AccountClient(transport), ctl);
+    fill(root, '#dd-user', 'alice');
+    fill(root, '#dd-pass', 'pw');
+    submitForm(root);
+    await waitFor(() => root.querySelector('.dd-blhead') !== null);
+    openDeviceKeys(root);
+    await waitFor(() => root.innerHTML.includes('THIS DEVICE'));
+
+    click(root, '[data-action="revoke-device"][data-device="d2"]');
+    await waitFor(() => root.innerHTML.includes('Revoke this device?'));
+    click(root, '[data-action="revoke-confirm"]');
+
+    await waitFor(() => calls.some((c) => c.path === '/api/revoke-device'));
+    const call = calls.find((c) => c.path === '/api/revoke-device');
+    expect(call?.body['deviceId']).toBe('d2');
+    expect('record' in (call?.body ?? {})).toBe(false); // no record, and no crash
   });
 
   it('the Device keys Back button returns to the buddy list', async () => {
@@ -2252,6 +2590,28 @@ describe('buddy list header status control (the little ◆)', () => {
     await waitFor(() => root.querySelector('#dd-conn')?.textContent !== '● SECURE LINK');
   });
 
+  it('waking the tab (visibilitychange to visible) forces a reconnect, so the phone converges without a manual reload', async () => {
+    // A mobile browser freezes a backgrounded tab and silently kills the WebSocket during sleep; on wake
+    // the page believes it is still connected but the socket is dead. Requiring a force-reload on a phone
+    // is not acceptable, so the tab becoming visible must re-run the reconnect + reconcile cascade (which
+    // re-publishes the contact graph into the self-group and re-runs the self-group heal).
+    const { root, c } = await onBuddyList();
+    void root;
+    const dialsAfterLogin = c.connects;
+
+    // Simulate the phone waking: the tab becomes visible again.
+    Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });
+    document.dispatchEvent(new Event('visibilitychange'));
+    await waitFor(() => c.connects > dialsAfterLogin);
+    expect(c.connects).toBeGreaterThan(dialsAfterLogin); // a fresh reconnect ran on wake
+
+    // Throttled: a second wake within the window collapses to no extra reconnect.
+    const dialsAfterWake = c.connects;
+    document.dispatchEvent(new Event('visibilitychange'));
+    await new Promise((r) => setTimeout(r, 10));
+    expect(c.connects).toBe(dialsAfterWake); // throttle held; no reconnect storm
+  });
+
   it('a drop schedules a quiet countdown retry; the popover explains and Reconnect now redials at once', async () => {
     const { root, c } = await onBuddyList();
     const dialsAtLogin = c.connects;
@@ -2343,6 +2703,51 @@ describe('buddy list header status control (the little ◆)', () => {
     click(root, '[data-restore]');
     await waitFor(() => root.querySelector('#dd-compose-input') !== null);
     expect((root.querySelector('#dd-compose-input') as HTMLElement).textContent).toContain('half typed thought');
+  });
+
+  it('AIM behavior: an arriving message POPS ITS WINDOW to the front so you can answer it', async () => {
+    // A message used to raise only a toast ("message received"), leaving the conversation closed. That is
+    // wrong twice over: AIM put the actual message in front of you, AND an inbound burn countdown only
+    // arms when the message is VIEWED (hold-until-seen), so a message that merely toasted sat unseen with
+    // its timer never started (observed live: the sender's countdown ran, the receiver's did not).
+    const { root, c } = await onBuddyList();
+    c.emit('connection', { state: 'secure' });
+    expect(root.querySelector('#dd-compose-form')).toBeNull(); // no conversation open
+    c.emit('inbound-message', { conversationId: 'c1' });
+    // The conversation window is now open in front (which is also what arms the burn countdown).
+    await waitFor(() => root.querySelector('#dd-compose-form') !== null);
+  });
+
+  it('AIM behavior: a DOCKED conversation stays docked and its chip shows an unread indicator', async () => {
+    // Docking is a deliberate choice, so an arrival must not yank the window back. It must also not be
+    // silent: the chip carries a count so the user knows something is waiting.
+    const { root, c } = await onBuddyList((cc) => {
+      cc.buddies = [{ username: 'devinjacks', addedAt: 0, group: 'Buddies' }];
+    });
+    c.emit('connection', { state: 'secure' });
+    root.querySelector('[data-buddy-select="devinjacks"]')!.dispatchEvent(new Event('dblclick', { bubbles: true }));
+    await waitFor(() => root.querySelector('#dd-compose-form') !== null);
+    const convId = 'c1'; // the id the fake controller's transmit model carries
+    click(root, '[data-action="win-minimize"]');
+    await waitFor(() => root.querySelector('.dd-blhead') !== null);
+    expect(root.innerHTML).toContain('dd-menu-chip');
+    expect(root.innerHTML).not.toContain('dd-menu-chip-unread'); // nothing waiting yet
+
+    c.emit('inbound-message', { conversationId: convId });
+    // Still docked (no window stolen back), but the chip now advertises the unread arrival.
+    await waitFor(() => root.innerHTML.includes('dd-menu-chip-unread'));
+    expect(root.querySelector('#dd-compose-form')).toBeNull(); // stayed docked
+    expect(root.querySelector('.dd-chip-badge')?.textContent).toBe('1');
+
+    // A second arrival increments rather than duplicating the chip.
+    c.emit('inbound-message', { conversationId: convId });
+    await waitFor(() => root.querySelector('.dd-chip-badge')?.textContent === '2');
+    expect(root.querySelectorAll('.dd-menu-chip')).toHaveLength(1);
+
+    // Restoring clears it (restore reopens the conversation, marking it seen).
+    click(root, '[data-restore]');
+    await waitFor(() => root.querySelector('#dd-compose-form') !== null);
+    expect(root.innerHTML).not.toContain('dd-menu-chip-unread');
   });
 
   it('minimize sends the window to a menu-bar chip, the chip restores it, and close just dismisses', async () => {

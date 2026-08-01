@@ -153,6 +153,16 @@
 }
 .dd-menu-chip:hover { background: var(--dd-face-hot); }
 .dd-menu-chip:active { box-shadow: var(--dd-bevel-pressed); }
+/* A docked conversation with unread arrivals: the AIM taskbar flashed so a minimized window never
+   swallowed a message silently. Steady emphasis plus a gentle pulse (skipped under reduced motion). */
+.dd-menu-chip-unread { background: var(--dd-accent, #2f5fd0); color: #fff; font-weight: 700; animation: dd-chip-pulse 1.6s ease-in-out infinite; }
+.dd-menu-chip-unread:hover { background: var(--dd-accent, #2f5fd0); filter: brightness(1.12); }
+.dd-chip-badge {
+  display: inline-block; min-width: 14px; margin-left: 5px; padding: 0 4px;
+  border-radius: 7px; background: #d33; color: #fff; font-size: 10px; line-height: 14px; text-align: center;
+}
+@keyframes dd-chip-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.62; } }
+@media (prefers-reduced-motion: reduce) { .dd-menu-chip-unread { animation: none; } }
 .dd-menu-conn {
   padding: 3px 8px;
   color: var(--dd-chrome-dim);
@@ -1552,21 +1562,22 @@ div.dd-tree-buddy:hover { background: transparent; }
 .dd-native .dd-titlebar .dd-winctl,
 .dd-native .dd-titlebar .dd-winmenu { -webkit-app-region: no-drag; }
 
-/* ── Landing page: attribution, the Signal comparison, and the desktop downloads (AIM27) ─────────
+/* ── Landing page: attribution, the desktop downloads, and the Signal comparison (AIM27) ─────────
    These sit under the login form on the WEB only; renderUnlock omits the last two inside the native
    shell. Everything is class-driven (the strict CSP forbids inline styles), and the measure widens
    past .dd-form-note's 30ch because a comparison table needs the room. */
 .dd-attrib { max-width: none; margin-top: 10px; text-align: center; }
-.dd-extlink { color: var(--dd-accent); text-decoration: underline; }
+.dd-extlink { color: var(--dd-accent, #5a9be0); text-decoration: underline; }
 .dd-extlink:hover { color: var(--dd-ink); }
 
 .dd-compare {
+  box-sizing: border-box;
   width: 100%;
   max-width: 560px;
   margin-top: 18px;
   padding: 12px 14px;
   border: 1px solid var(--dd-rim);
-  border-radius: 10px;
+  border-radius: var(--dd-radius-sm);
   background: var(--dd-face);
   box-shadow: var(--dd-bevel);
 }
@@ -1600,6 +1611,39 @@ div.dd-tree-buddy:hover { background: transparent; }
 .dd-compare-table tbody tr:last-child td { border-bottom: none; }
 .dd-compare-note { margin-top: 10px; font-size: 11px; line-height: 1.5; color: var(--dd-chrome-dim); }
 
+/* Phones: STACK the comparison instead of scrolling it sideways. Three columns plus nowrap row headers
+   give the table a ~352px intrinsic width, and at 375px there are only ~255px inside the box, so the
+   Signal column sat off the edge and read as cut off. Here each row becomes a labelled block: the
+   feature is a heading, and each cell prints its column name from data-col. The form's side padding
+   also comes down, which hands the whole landing column another ~24px. */
+@media (max-width: 560px) {
+  .dd-form { padding-left: 12px; padding-right: 12px; }
+  .dd-compare-table { display: block; overflow-x: visible; }
+  .dd-compare-table thead { display: none; }
+  .dd-compare-table tbody,
+  .dd-compare-table tr,
+  .dd-compare-table th,
+  .dd-compare-table td { display: block; width: auto; }
+  .dd-compare-table tr { padding: 8px 0; border-bottom: 1px solid var(--dd-rim); }
+  .dd-compare-table tr:last-child { border-bottom: none; }
+  .dd-compare-table tbody th {
+    padding: 0 0 4px;
+    border-bottom: none;
+    white-space: normal; /* the nowrap that widened the table is exactly what must not apply here */
+    font-weight: 700;
+  }
+  .dd-compare-table tbody td { padding: 0 0 4px; border-bottom: none; }
+  .dd-compare-table tbody tr td:last-child { padding-bottom: 0; }
+  .dd-compare-table tbody td::before {
+    content: attr(data-col);
+    display: block;
+    font-size: 10px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--dd-chrome-ink);
+  }
+}
+
 .dd-downloads { width: 100%; max-width: 560px; margin-top: 14px; text-align: center; }
 .dd-downloads-title {
   font-size: 12px;
@@ -1629,3 +1673,61 @@ div.dd-tree-buddy:hover { background: transparent; }
   overflow-wrap: break-word;
 }
 .dd-pitch-p:last-child { margin-bottom: 0; }
+
+/* ── Contact verification (Verify Buddy panel + buddy-list badge) ─────────────────────────────────
+   The panel reuses .dd-sas-words for the six words. Framed panels size border-box and take the theme
+   radius so the retro themes square them (the R13 review's lesson, applied from the start). */
+.dd-verify {
+  box-sizing: border-box;
+  width: 100%;
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--dd-rim);
+  border-radius: var(--dd-radius-sm);
+  background: rgba(120, 140, 200, 0.06);
+}
+.dd-verify-title {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--dd-chrome-ink);
+  margin-bottom: 6px;
+}
+.dd-verify-ok .dd-verify-title { color: #74f0a8; }
+.dd-verify-changed { border-color: #7a2a2a; background: rgba(122, 42, 42, 0.12); }
+.dd-verify-changed .dd-verify-title { color: #ff8f8f; }
+.dd-verify-warn { font-size: 12px; line-height: 1.5; color: #ffd7d7; margin-bottom: 6px; }
+.dd-verify-words { margin: 6px 0; }
+.dd-verify .dd-form-note { max-width: none; }
+.dd-verify .dd-field { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+
+/* The list badge rides inside the name label: a quiet check, or a loud changed marker. */
+.dd-tree-verify {
+  margin-left: 4px;
+  font-size: 10px;
+  color: #74f0a8;
+}
+/* Pinned but not currently checkable: a hollow, dim marker. Deliberately not green and not the check
+   glyph, so it can never be misread as a live confirmation. */
+.dd-tree-verify-stale { color: var(--dd-chrome-dim); }
+.dd-tree-verify-bad {
+  color: #ff8f8f;
+  font-weight: 700;
+  padding: 0 4px;
+  border: 1px solid #7a2a2a;
+  border-radius: var(--dd-radius-sm);
+  background: rgba(122, 42, 42, 0.25);
+}
+
+/* Two phrases, side by side on a wide window and stacked on a narrow one. */
+.dd-verify-pair { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0; }
+.dd-verify-half { flex: 1 1 220px; min-width: 0; }
+.dd-verify-label {
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--dd-chrome-dim);
+  margin-bottom: 2px;
+}
+.dd-verify-stale { border-style: dashed; }
+.dd-verify-stale .dd-verify-title { color: var(--dd-chrome-dim); }

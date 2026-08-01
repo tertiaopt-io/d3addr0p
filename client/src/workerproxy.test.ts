@@ -32,6 +32,16 @@ describe('WorkerController proxy', () => {
     expect(t.posted[0]?.args).toEqual(['alice', 'pass']);
   });
 
+  it('sends the auth-secret KDF to the worker, so the ~64 MiB Argon2id never runs on the main thread', async () => {
+    const key = new Uint8Array([1, 2, 3, 4]);
+    const t = new FakeTransport((op) => (op === 'deriveAuthKey' ? { ok: true, result: key } : { ok: true }));
+    const c = new WorkerController(t);
+    const salt = new Uint8Array([9, 9]);
+    expect(await c.deriveAuthKey('correct horse', salt)).toEqual(key);
+    expect(t.posted[0]?.op).toBe('deriveAuthKey');
+    expect(t.posted[0]?.args).toEqual(['correct horse', salt]);
+  });
+
   it('resolves listChannels and openChannel results', async () => {
     const channels = [{ id: 'a', peer: 'A', fingerprint: 'x', status: 'secure', preview: '', unread: 0 }];
     const t = new FakeTransport((op) => {

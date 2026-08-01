@@ -33,6 +33,7 @@ import {
   type TransmitModel,
   type IdentityProfile,
   type PeerIdentity,
+  type BuddyVerifyInfo,
   type Buddy,
   type GroupSummary,
   type BlockedContact,
@@ -146,6 +147,15 @@ describe('transmit renderer (M5 skin)', () => {
     const html = renderTransmit(model);
     expect(html).toContain('Note to Self');
     expect(html).toContain('only your devices see this');
+    // The self-group split diagnostic rides this subtitle: the group id alone could not say WHICH
+    // device minted, so roster size and the Welcome counters go on screen next to it (the phone has
+    // no console, and device-local MLS state is invisible to the keyless gateway).
+    const diagnosed = renderTransmit({ ...model, selfDiag: '2 devices · W1/0 · NoMatchingKeyPackage' });
+    expect(diagnosed).toContain('group self');
+    expect(diagnosed).toContain('2 devices');
+    expect(diagnosed).toContain('W1/0');
+    expect(diagnosed).toContain('NoMatchingKeyPackage');
+    expect(html).not.toContain('W1/0'); // absent when there is nothing to report
     // The peer-only controls must be absent: Add would inject a peer into the own-devices self-group.
     expect(html).not.toContain('data-action="add-person"');
     expect(html).not.toContain('data-action="get-info"');
@@ -854,6 +864,66 @@ describe('peer Get-Info panel', () => {
     expect(html).toContain('&lt;script&gt;');
     expect(html).not.toContain('<script>x');
   });
+
+  const vi = (state: BuddyVerifyInfo['state']) => ({
+    peerKey: state === 'stale' ? '' : 'ab'.repeat(32),
+    peerFingerprint: state === 'stale' ? '' : 'AB·AB·AB·AB',
+    ourFingerprint: 'CD·CD·CD·CD',
+    ourWords: 'tavo ken rilm bax sodu quen zim lorn',
+    theirWords: 'polm ved sest kuun dax rel mub tass',
+    verifiedKey: state === 'verified' || state === 'changed' || state === 'stale' ? 'ee'.repeat(32) : '',
+    state,
+  });
+
+  it('offers Mark as Verified with BOTH phrases when the buddy is comparable and unverified', () => {
+    const html = renderGetInfo('RAVEN', [], undefined, undefined, undefined, vi('none'));
+    expect(html).toContain('Verify buddy');
+    // Both halves must be present and labelled: a single shared phrase is the broken design.
+    expect(html).toContain('tavo ken rilm bax sodu quen zim lorn');
+    expect(html).toContain('polm ved sest kuun dax rel mub tass');
+    expect(html).toContain('your words');
+    expect(html).toContain('their words');
+    expect(html).toContain('compare BOTH sets');
+    expect(html).toContain('data-action="verify-mark"');
+    expect(html).not.toContain('Identity changed');
+  });
+
+  it('never claims a pin is being watched when the current key is unreadable', () => {
+    const html = renderGetInfo('RAVEN', [], undefined, undefined, undefined, vi('stale'));
+    expect(html).toContain('not checkable right now');
+    expect(html).toContain('treat this channel as unconfirmed');
+    // The reassuring language and the phrase boxes must BOTH be absent: there is nothing to compare.
+    expect(html).not.toContain('Verified buddy');
+    expect(html).not.toContain('dd-verify-words');
+    expect(html).not.toContain('data-action="verify-mark"');
+  });
+
+  it('shows the pinned state with a forget option once verified', () => {
+    const html = renderGetInfo('RAVEN', [], undefined, undefined, undefined, vi('verified'));
+    expect(html).toContain('Verified buddy');
+    expect(html).toContain('While this device can');
+    expect(html).toContain('data-action="verify-clear"');
+    expect(html).not.toContain('Mark as Verified');
+  });
+
+  it('screams on a changed key and gates re-trust behind the danger button', () => {
+    const html = renderGetInfo('RAVEN', [], undefined, undefined, undefined, vi('changed'));
+    expect(html).toContain('Identity changed');
+    expect(html).toContain('NOT the one you verified');
+    expect(html).toContain('dd-btn-danger');
+    expect(html).toContain('Verify the new key');
+    // The armed second tap renames the button so the user knows the next tap commits.
+    const armed = renderGetInfo('RAVEN', [], undefined, undefined, undefined, vi('changed'), true);
+    expect(armed).toContain('Tap again to trust the new key');
+  });
+
+  it('explains itself when there is nothing to compare, and never shows on your own card', () => {
+    const html = renderGetInfo('RAVEN', [], undefined, undefined, undefined, vi('unavailable'));
+    expect(html).toContain('Nothing to compare yet');
+    expect(html).not.toContain('verify-mark');
+    const own = renderGetInfo('me', [], undefined, undefined, true, vi('none'));
+    expect(own).not.toContain('Verify buddy');
+  });
 });
 
 // A profile with the away responder on, for the toolbar-check and header-bubble tests.
@@ -1530,5 +1600,30 @@ describe('add-a-buddy by QR (contact exchange)', () => {
     expect(parseContactLink('https://d3addr0p.com/#other=1')).toBeNull(); // fragment without dd=
     expect(parseContactLink('#dd=carol')?.username).toBe('carol'); // bare fragment, no fingerprint
     expect(parseContactLink('#dd=carol')?.fingerprint).toBe('');
+  });
+});
+
+
+describe('buddy verification badge', () => {
+  const buddy = { username: 'raven', addedAt: 1, group: 'Buddies' };
+  it('marks a verified buddy with a quiet check and a changed one loudly', () => {
+    const ok = renderBuddies([buddy], [], { raven: 'online' }, [], [], [], DEFAULT_IDENTITY, 'me', {}, {}, undefined, {}, { raven: 'verified' });
+    expect(ok).toContain('dd-tree-verify');
+    expect(ok).toContain('\u2713');
+    const bad = renderBuddies([buddy], [], { raven: 'online' }, [], [], [], DEFAULT_IDENTITY, 'me', {}, {}, undefined, {}, { raven: 'changed' });
+    expect(bad).toContain('dd-tree-verify-bad');
+    expect(bad).toContain('identity changed');
+  });
+  it('renders a pinned-but-uncheckable buddy distinctly, never as a confident check', () => {
+    const stale = renderBuddies([buddy], [], { raven: 'online' }, [], [], [], DEFAULT_IDENTITY, 'me', {}, {}, undefined, {}, { raven: 'stale' });
+    expect(stale).toContain('dd-tree-verify-stale');
+    expect(stale).toContain('cannot check right now');
+    // The confident check belongs to 'verified' alone (matched by its exact title attribute, since
+    // other chrome on this screen legitimately uses a check glyph).
+    expect(stale).not.toContain('title="verified"');
+  });
+  it('leaves an unverified buddy unadorned (no alarm fatigue)', () => {
+    const html = renderBuddies([buddy], [], { raven: 'online' }, [], [], [], DEFAULT_IDENTITY, 'me', {});
+    expect(html).not.toContain('dd-tree-verify');
   });
 });

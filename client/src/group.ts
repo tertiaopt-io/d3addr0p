@@ -37,6 +37,10 @@ export interface GroupConversationLike {
   signaturePublicKeyHex(): string;
   accountKeyHex(): string; // the account authorization key (empty for a legacy/unauthorized identity)
   keyPackage(): Uint8Array;
+  // The LAST-RESORT package: carries the MLS LastResort extension so OpenMLS keeps its private
+  // bundle after a join. The directory re-serves that row forever, so an unmarked package there is
+  // un-openable from the second claim on. Optional so older wasm builds still load.
+  keyPackageLastResort?(): Uint8Array;
   // MULTI-GROUP (one device, many conversations): every per-conversation method takes the conversation's
   // groupId (hex of the MLS group id). createGroup returns a length-prefixed [welcome, groupId] for the
   // NEW conversation; joinFromWelcome returns the joined conversation's groupId (hex). receive ROUTES by
@@ -55,6 +59,13 @@ export interface GroupConversationLike {
   // Whether a held conversation provably has no reachable recipient (certless non-own leaf, no
   // verified foreign device). Advisory only. Optional (older wasm).
   channelUnlinked?(conversationId: string): boolean;
+  // The distinct FOREIGN account authority keys (hex, sorted) among members whose device certs verify.
+  // The anchor contact verification pins. Optional (older wasm).
+  peerAccountKeys?(conversationId: string): string[];
+  // Persist the ADVANCED receive ratchet (the library only writes it on send), so a seized powered-off
+  // device cannot re-derive messages it already processed. False = this epoch's budget is spent.
+  // Optional (older wasm).
+  flushReceiveRatchet?(conversationId: string): boolean;
   createSelf(): Uint8Array; // SOLO own-devices group (no member admitted, so no welcome): returns groupId
   listConversations(): string[]; // groupId hex of every open conversation
   addMember(conversationId: string, keyPackage: Uint8Array): Uint8Array; // returns [commit, welcome]
@@ -93,6 +104,16 @@ export interface GroupConversationLike {
   // STRICT variant: our own leaf must also carry a verifying certificate (no own-leaf exemption). Used
   // only to PREFER a fully certified self-group during canonical-group selection.
   isSelfConversationStrict?(conversationId: string): boolean;
+  // READ-ONLY diagnostic: WHY a conversation is or is not a self-group ("self" when it is). Makes no
+  // decision and grants no access; surfaced so a stuck self-classification is diagnosed by reading the
+  // cause instead of guessing at MLS rosters the keyless gateway cannot show.
+  selfClassificationReason?(conversationId: string): string;
+  // SG2 self-heal: abandon an own-devices group that is provably DEAD (a frozen certless leaf makes it
+  // unrepairable in place and it can never sync). `recordedSelf` is the CALLER's durable record that
+  // this id is one of our self-groups: the crypto layer cannot derive it (a peer chat whose peer was
+  // still certless looks identical), so it refuses without it. Also refuses a group that still has any
+  // verified sibling. Returns true when it abandoned one.
+  abandonDeadSelfGroup?(conversationId: string, recordedSelf: boolean): boolean;
   // Whether our CURRENT credential carries a verifying certificate (a fresh mint would be strict).
   // Bounds the certified-replacement mint: a legacy label-only credential must not replace, ever.
   credentialCertified?(): boolean;
@@ -110,6 +131,18 @@ export interface GroupConversationLike {
   recoverWithSeed(recoverySeedHex: string, certEpoch: number): void;
   reauthorizeAtEpoch(certEpoch: number): void;
   certEpoch(): number;
+  // ADR-022 P7 signed revocation records: the account's DENYLIST, and the thing that actually excludes a
+  // revoked device. The epoch above is only a lower bound, and a revoked device that still holds the
+  // account seed re-certifies itself above any bound, so exclusion has to name the device's key.
+  // revokeDevice mints a record (seed-holder only) and returns it as hex to publish; ingestRevocation
+  // accepts one fetched from the control plane, erroring on anything that does not verify under our own
+  // account key; revokedCount is the DERIVED epoch (|records|), which every device computes identically
+  // offline; accountFloor is the lowest epoch this device will now certify at.
+  revokeDevice?(deviceSigKeyHex: string, issuedSeq: number): string;
+  ingestRevocation?(recordHex: string): boolean;
+  revokedCount?(): number;
+  isDeviceRevoked?(deviceSigKeyHex: string): boolean;
+  accountFloor?(): number;
   wipe(): void;
 }
 
@@ -201,11 +234,38 @@ export class GroupSession {
     return this.conv.isSelfConversationStrict?.(this.groupId) ?? false;
   }
 
+  /** READ-ONLY diagnostic: the classifier's reason this conversation is or is not a self-group ("self"
+   * when it is). '' on an older wasm without the accessor. Never changes behavior; surfaced so a stuck
+   * self-classification is diagnosed by reading the cause. */
+  selfClassificationReason(): string {
+    return this.conv.selfClassificationReason?.(this.groupId) ?? '';
+  }
+
   /** Whether this conversation provably has no reachable recipient. Advisory only; false on an older
    * wasm or any classification error (fail-safe: no advisory beats a wrong one). */
   unlinked(): boolean {
     try {
       return this.conv.channelUnlinked?.(this.groupId) ?? false;
+    } catch {
+      return false;
+    }
+  }
+
+  /** The distinct foreign account keys (hex) of this conversation's cert-verified members. Empty on an
+   * older wasm or any error (fail-safe: showing nothing to verify beats pinning a wrong key). */
+  peerAccountKeys(): string[] {
+    try {
+      return this.conv.peerAccountKeys?.(this.groupId) ?? [];
+    } catch {
+      return [];
+    }
+  }
+
+  /** Persist the advanced receive ratchet for this conversation. Returns false when the wasm is older,
+   * the budget for this epoch is spent, or anything throws, so the caller can skip a pointless re-seal. */
+  flushReceiveRatchet(): boolean {
+    try {
+      return this.conv.flushReceiveRatchet?.(this.groupId) ?? false;
     } catch {
       return false;
     }

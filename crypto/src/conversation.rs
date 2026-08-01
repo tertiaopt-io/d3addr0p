@@ -65,6 +65,11 @@ impl Pending {
     }
 }
 
+/// How many throwaway encrypts one epoch may spend flushing the receive ratchet. OpenMLS peers accept a
+/// send-generation jump up to `maximum_forward_distance` (1000 by default), so this stays far below it:
+/// even a conversation where we only ever listen keeps every peer able to decrypt our next real message.
+const FLUSH_BURN_BUDGET: u32 = 200;
+
 pub(crate) struct GroupSlot {
     group: MlsGroup,
     // The account keys trusted in THIS conversation (this account plus the peer), each with a minimum
@@ -78,6 +83,16 @@ pub(crate) struct GroupSlot {
     // container's pendings section + the StagedCommit in provider storage) so a mid-confirm crash resumes
     // the SAME commit rather than re-staging a distinct one and forking.
     pending: Option<Pending>,
+    // How many throwaway encrypts flush_receive_ratchet has spent on THIS group IN flush_epoch. Each one
+    // advances our own send generation by 1, and a peer refuses a jump beyond its forward distance (1000
+    // by default), so the cap keeps us inside that window. A real send does NOT reset it (see the NOTE in
+    // encrypt_inner: our own send proves nothing about what the peer received). Both fields are persisted,
+    // or the cap would silently become per page load.
+    flush_burns: u32,
+    // The MLS epoch flush_burns was counted in. Generations restart at 0 in a new epoch, so the budget is
+    // scoped to one epoch and refills when the group advances to the next. Without this the count only
+    // ever rose and the protection permanently disabled itself after 200 flushes in the group's LIFETIME.
+    flush_epoch: u64,
 }
 
 #[wasm_bindgen]
@@ -103,7 +118,22 @@ pub struct Conversation {
     // below N to re-admit a revoked, old-epoch device in ANOTHER conversation. First contact is
     // trust-on-first-use (acknowledged out of band, P7).
     account_floors: Vec<(Vec<u8>, u64)>,
+    // ADR-022 P7: the signed revocation records this device has accepted for OUR OWN account, as raw
+    // 140-byte blobs (see revoke.rs). DEVICE-GLOBAL and APPEND-ONLY: a record, once verified, is never
+    // dropped, so a hostile control plane can withhold records (a liveness failure that leaves the old
+    // floor behavior in place) but can never retract one it has already served.
+    //
+    // This is what actually EXCLUDES a device. account_floors above is a lower bound and cannot: a
+    // revoked seed-holder still has the account seed on its own disk and simply re-certifies itself at
+    // a higher epoch. The floor is kept because it still defends the cert-only majority against a
+    // rollback of their credentials, but authorization now turns on identity, not ordering.
+    revocations: Vec<Vec<u8>>,
 }
+
+/// The most revocation records one device will hold for its account. Mirrors the control plane's own
+/// cap (UserStore::MAX_REVOCATIONS). Generous, because a record only exists because a real device was
+/// revoked, but finite, so the gate's per-add verification cost is bounded no matter what is served.
+const MAX_REVOCATIONS: usize = 512;
 
 /// Prefix on a `receive` error message that marks the frame PERMANENTLY unprocessable, so the client
 /// acks it (drops it from the bus) instead of holding it for redelivery. Mirrored in the client as
@@ -155,6 +185,10 @@ fn encode_container(
     // re-publish the commit AND the added device's Welcome. Appended LAST, so pre-fix readers stop before
     // it and pre-fix blobs simply lack it (decode returns empty).
     pendings: &[(Vec<u8>, u8, Vec<u8>, Vec<u8>, Vec<u8>)],
+    // Per-group flush counters (group_id, burns, epoch). Appended after the pendings; see the write site.
+    flush_burns: &[(Vec<u8>, u32, u64)],
+    // ADR-022 P7: the accepted signed revocation records, raw blobs. Appended after the flush counters.
+    revocations: &[Vec<u8>],
 ) -> Result<Vec<u8>, String> {
     let count = u32::try_from(entries.len()).map_err(|_| "too many entries".to_string())?;
     let mut out = Vec::new();
@@ -209,6 +243,32 @@ fn encode_container(
         put_bytes(&mut out, commit)?;
         put_bytes(&mut out, welcome)?;
     }
+    // Per-group receive-ratchet flush counters, appended LAST. These MUST survive a reload: each flush
+    // spends one of our MLS send generations, and the cap is the only thing keeping us inside the peer's
+    // forward-distance window. Held only in memory, the cap silently became "per page load" while the
+    // generation itself rode along inside the storage entries above, so a device that only ever listens
+    // drifted past the peer's limit and its eventual first real message became undecryptable by everyone,
+    // permanently and silently. A blob written before this section simply lacks it and decodes to empty,
+    // which restarts the count: acceptable once, catastrophic every reload.
+    let bcount = u32::try_from(flush_burns.len()).map_err(|_| "too many burn counters".to_string())?;
+    out.extend_from_slice(&bcount.to_be_bytes());
+    for (g, burns, epoch) in flush_burns {
+        put_bytes(&mut out, g)?;
+        out.extend_from_slice(&burns.to_be_bytes());
+        // The epoch the count belongs to. Without it a reload could not tell a spent budget from one the
+        // group has since moved past, and restoring the count alone would strand the group permanently.
+        out.extend_from_slice(&epoch.to_be_bytes());
+    }
+    // ADR-022 P7 revocation records, appended LAST. These are the account's DENYLIST and are the only
+    // thing that actually excludes a revoked seed-holder (the epoch floor above is a lower bound and a
+    // seed-holder simply mints above it). They MUST survive reload: losing them re-opens the hole until
+    // the next successful fetch from a control plane that is free to stall. Each is a self-verifying
+    // 140-byte blob, so a lost or truncated section degrades to "not yet known", never to a forgery.
+    let rcount = u32::try_from(revocations.len()).map_err(|_| "too many revocations".to_string())?;
+    out.extend_from_slice(&rcount.to_be_bytes());
+    for r in revocations {
+        put_bytes(&mut out, r)?;
+    }
     Ok(out)
 }
 
@@ -219,6 +279,15 @@ fn take_u32(b: &[u8], pos: &mut usize) -> Result<usize, String> {
     }
     let n = u32::from_be_bytes(b[*pos..*pos + 4].try_into().unwrap()) as usize;
     *pos += 4;
+    Ok(n)
+}
+
+fn take_u64(b: &[u8], pos: &mut usize) -> Result<u64, String> {
+    if b.len() - *pos < 8 {
+        return Err("container truncated".to_string());
+    }
+    let n = u64::from_be_bytes(b[*pos..*pos + 8].try_into().unwrap());
+    *pos += 8;
     Ok(n)
 }
 
@@ -235,7 +304,13 @@ fn take_bytes(b: &[u8], pos: &mut usize) -> Result<Vec<u8>, String> {
 /// Decode the trailing staged-pendings section leniently: any malformed or truncated entry yields an
 /// EMPTY list rather than an error, because this section is an optional recovery hint and a decode
 /// failure here must never brick the whole vault (see the call site in decode_container).
-fn decode_pendings(b: &[u8], mut pos: usize) -> Vec<(Vec<u8>, u8, Vec<u8>, Vec<u8>, Vec<u8>)> {
+/// Returns the staged pendings AND the offset just past them, so the trailing flush-counter section can
+/// be read next. On a malformed tail it yields an empty list and an offset PAST THE END of the buffer,
+/// which is what actually makes the following section decode as empty. Returning the original offset
+/// (an earlier cut) did not: the burns decoder would have read the pendings bytes it just rejected and
+/// could interpret them as a valid section.
+fn decode_pendings(b: &[u8], mut pos: usize) -> (Vec<(Vec<u8>, u8, Vec<u8>, Vec<u8>, Vec<u8>)>, usize) {
+    let start = pos;
     let parse = |pos: &mut usize| -> Result<Vec<(Vec<u8>, u8, Vec<u8>, Vec<u8>, Vec<u8>)>, String> {
         if *pos >= b.len() {
             return Ok(Vec::new());
@@ -253,6 +328,56 @@ fn decode_pendings(b: &[u8], mut pos: usize) -> Vec<(Vec<u8>, u8, Vec<u8>, Vec<u
         }
         Ok(pendings)
     };
+    let _ = start;
+    match parse(&mut pos) {
+        Ok(p) => (p, pos),
+        Err(_) => (Vec::new(), b.len()), // past the end: the next section decodes as empty, not garbage
+    }
+}
+
+/// The per-group receive-ratchet flush counters written by encode_container. Absent (older blob) or
+/// malformed decodes to empty, which restarts the count for that group. Returns the offset just past
+/// the section so the trailing revocations can be read next; on a malformed tail the offset is PAST THE
+/// END, so the next section decodes as empty rather than re-reading the bytes just rejected (the same
+/// discipline as decode_pendings).
+fn decode_flush_burns(b: &[u8], mut pos: usize) -> (Vec<(Vec<u8>, u32, u64)>, usize) {
+    let parse = |pos: &mut usize| -> Result<Vec<(Vec<u8>, u32, u64)>, String> {
+        if *pos >= b.len() {
+            return Ok(Vec::new());
+        }
+        let bcount = take_u32(b, pos)?;
+        let mut out = Vec::new();
+        for _ in 0..bcount {
+            let g = take_bytes(b, pos)?;
+            let burns = u32::try_from(take_u32(b, pos)?).map_err(|_| "burn count overflow".to_string())?;
+            let epoch = take_u64(b, pos)?;
+            out.push((g, burns, epoch));
+        }
+        Ok(out)
+    };
+    match parse(&mut pos) {
+        Ok(v) => (v, pos),
+        Err(_) => (Vec::new(), b.len()),
+    }
+}
+
+/// The trailing ADR-022 P7 revocation-record section. Absent (an older blob) or malformed decodes to
+/// EMPTY rather than Err, for the same reason decode_pendings is lenient: a hard failure here would
+/// fail the whole from_sealed and drop the device to a fresh identity, which is strictly worse than
+/// re-fetching the records from the control plane. Every record is re-verified against our own account
+/// key at ingest, so an empty or partial read costs liveness, never soundness.
+fn decode_revocations(b: &[u8], mut pos: usize) -> Vec<Vec<u8>> {
+    let parse = |pos: &mut usize| -> Result<Vec<Vec<u8>>, String> {
+        if *pos >= b.len() {
+            return Ok(Vec::new());
+        }
+        let rcount = take_u32(b, pos)?;
+        let mut out = Vec::new();
+        for _ in 0..rcount {
+            out.push(take_bytes(b, pos)?);
+        }
+        Ok(out)
+    };
     parse(&mut pos).unwrap_or_default()
 }
 
@@ -267,6 +392,8 @@ type DecodedContainer = (
     Vec<Vec<u8>>,            // account floors (device-global)
     Vec<(Vec<u8>, Vec<Vec<u8>>)>, // multi-group conversations: (group_id, [aak_pub||epoch])
     Vec<(Vec<u8>, u8, Vec<u8>, Vec<u8>, Vec<u8>)>, // staged pendings: (group_id, kind, target, commit, welcome)
+    Vec<(Vec<u8>, u32, u64)>, // per-group receive-ratchet flush counters (group_id, burns, epoch)
+    Vec<Vec<u8>>,            // ADR-022 P7 signed revocation records (raw blobs, re-verified at load)
 );
 
 /// One conversation's reload metadata: its group id and its parsed (account, epoch) trusted set.
@@ -341,8 +468,10 @@ fn decode_container(b: &[u8]) -> Result<DecodedContainer, String> {
     // decode: a failed from_sealed makes loadSelf fall back to a FRESH identity and the login flow then
     // reseals over the real vault within seconds. So any error inside this section degrades to "no
     // pending" (equivalent to the pre-fix self-heal), never Err.
-    let pendings = decode_pendings(b, pos);
-    Ok((entries, signer, label, gid, aak_seed, trusted, cred_identity, account_floors, groups, pendings))
+    let (pendings, after_pendings) = decode_pendings(b, pos);
+    let (flush_burns, after_burns) = decode_flush_burns(b, after_pendings);
+    let revocations = decode_revocations(b, after_burns);
+    Ok((entries, signer, label, gid, aak_seed, trusted, cred_identity, account_floors, groups, pendings, flush_burns, revocations))
 }
 
 /// A length-prefixed list of byte strings (count, then each as u32-len + bytes), used to pass a list
@@ -470,6 +599,20 @@ pub fn sas_digest_hex(
     Ok(hex(&authz::sas_digest(&nonce, &account_pub, &device_key, u64::from(cert_epoch))))
 }
 
+/// The contact identity digest for ONE account key (hex). Each side of a conversation renders its own
+/// key's words and both people compare both halves, so a man in the middle faces two independent
+/// second preimages against fixed targets rather than one birthday collision he controls. Rejects
+/// anything that is not exactly a 32-byte key, so a truncated or empty value can never render a
+/// confident-looking phrase.
+#[wasm_bindgen(js_name = contactIdentDigestHex)]
+pub fn contact_ident_digest_hex(aak_hex: &str) -> Result<String, JsError> {
+    let a = hex_to_bytes(aak_hex).map_err(js)?;
+    if a.len() != 32 {
+        return Err(js("contact identity digest needs a 32-byte account key".to_string()));
+    }
+    Ok(hex(&authz::contact_ident_digest(&a)))
+}
+
 /// Generate a fresh ephemeral X25519 keypair for a QR pairing attempt: `secret(32) || public(32)`. The
 /// new device keeps the secret in memory and puts the public key in its QR (add-a-device-by-QR).
 #[wasm_bindgen(js_name = provisionEphemeralKeypair)]
@@ -534,6 +677,53 @@ impl Conversation {
     #[wasm_bindgen(js_name = certEpoch)]
     pub fn cert_epoch(&self) -> u32 {
         self.cert_epoch_inner() as u32
+    }
+
+    /// ADR-022 P7. Seed-holder: issue a signed revocation record naming `deviceSigKeyHex`, adopt it on
+    /// this device immediately, and return it as hex for the caller to publish so every other device of
+    /// the account learns it. This, not the epoch, is what excludes the device: the gate refuses a
+    /// named key however high an epoch it mints for itself.
+    #[wasm_bindgen(js_name = revokeDevice)]
+    pub fn revoke_device(&mut self, device_sig_key_hex: &str, issued_seq: u32) -> Result<String, JsError> {
+        self.revoke_device_inner(device_sig_key_hex, u64::from(issued_seq)).map_err(js)
+    }
+
+    /// ADR-022 P7. Accept one revocation record fetched from the control plane. Returns true if it was
+    /// new. Errs on a record that does not verify under THIS account's key, so a hostile or buggy
+    /// control plane can withhold records (costing liveness) but never inject one.
+    #[wasm_bindgen(js_name = ingestRevocation)]
+    pub fn ingest_revocation(&mut self, record_hex: &str) -> Result<bool, JsError> {
+        let blob = hex_to_bytes(record_hex).map_err(js)?;
+        self.ingest_revocation_inner(&blob).map_err(js)
+    }
+
+    /// How many revocation records this device holds for its own account. This is the DERIVED epoch:
+    /// every device with the same records computes the same number offline, so the app can show it and
+    /// compare it against the control plane's counter without treating that counter as authoritative.
+    #[wasm_bindgen(js_name = revokedCount)]
+    pub fn revoked_count(&self) -> u32 {
+        self.revoked_device_keys().len() as u32
+    }
+
+    /// Whether this account has revoked `deviceSigKeyHex`, per the records this device holds. Used by
+    /// the UI to mark a device row and to keep a revoked key out of a pairing attempt.
+    #[wasm_bindgen(js_name = isDeviceRevoked)]
+    pub fn is_device_revoked(&self, device_sig_key_hex: &str) -> bool {
+        match hex_to_bytes(device_sig_key_hex) {
+            Ok(k) => self.is_revoked(&k),
+            Err(_) => false,
+        }
+    }
+
+    /// This device's effective epoch floor for its own account: the highest certificate epoch it has
+    /// ever accepted, which is also the lowest it will now certify at. Exposed so a stuck pairing can be
+    /// diagnosed by READING the number rather than inferring it from a rejection.
+    #[wasm_bindgen(js_name = accountFloor)]
+    pub fn account_floor(&self) -> u32 {
+        match self.our_account_pub() {
+            Some(a) => self.effective_floor(&a, 0) as u32,
+            None => 0,
+        }
     }
 
     /// This account's authorization-key public value (its stable cryptographic identity) as hex, or
@@ -606,9 +796,23 @@ impl Conversation {
 
     /// Mint a fresh public KeyPackage (private parts stored in our provider) for a peer to add
     /// us. A fresh package per conversation; KeyPackages are single-use in MLS.
+    ///
+    /// The caller MUST persist this device's sealed state before publishing the returned public half
+    /// (see the client's `freshKeyPackages`): the private material lives only in the provider's
+    /// in-memory storage map until a reseal writes it down, and a published package whose private
+    /// half did not survive a reload is a Welcome nobody can open.
     #[wasm_bindgen(js_name = keyPackage)]
     pub fn key_package(&self) -> Result<Vec<u8>, JsError> {
-        fresh_key_package_bytes(&self.provider, &self.signer, self.credential.clone()).map_err(js)
+        fresh_key_package_bytes(&self.provider, &self.signer, self.credential.clone(), false).map_err(js)
+    }
+
+    /// Mint the LAST-RESORT KeyPackage: the one the directory re-serves after the one-time packages
+    /// are drained. It carries the MLS LastResort extension so OpenMLS does NOT delete the private
+    /// bundle after a join, making the package genuinely reusable — which is what the server already
+    /// assumes (UserStore keeps one permanently claimable `is_last_resort = 1` row).
+    #[wasm_bindgen(js_name = keyPackageLastResort)]
+    pub fn key_package_last_resort(&self) -> Result<Vec<u8>, JsError> {
+        fresh_key_package_bytes(&self.provider, &self.signer, self.credential.clone(), true).map_err(js)
     }
 
     /// Group-CREATOR path (the accepter): create a 1:1 conversation, add the peer from their public
@@ -795,6 +999,30 @@ impl Conversation {
         self.channel_unlinked_inner(conversation_id).map_err(js)
     }
 
+    /// SG2 self-heal: abandon an own-devices group that is provably DEAD (unlinked), so a poisoned
+    /// self-group cannot strand the account. Refuses a peer conversation and refuses a self-group that
+    /// still has any verified sibling. Returns true when it abandoned one.
+    #[wasm_bindgen(js_name = abandonDeadSelfGroup)]
+    pub fn abandon_dead_self_group(&mut self, conversation_id: &str, recorded_self: bool) -> Result<bool, JsError> {
+        self.abandon_dead_self_group_inner(conversation_id, recorded_self).map_err(js)
+    }
+
+    /// Persist the advanced receive ratchet for one conversation (see flush_receive_ratchet_inner).
+    /// Returns false when this epoch's flush budget is spent, so the caller can skip the re-seal.
+    #[wasm_bindgen(js_name = flushReceiveRatchet)]
+    pub fn flush_receive_ratchet(&mut self, conversation_id: &str) -> Result<bool, JsError> {
+        self.flush_receive_ratchet_inner(conversation_id).map_err(js)
+    }
+
+    /// The distinct FOREIGN account authority keys (hex, sorted) present in this conversation, counting
+    /// only members whose device certificates verify. This is what contact verification pins: a buddy's
+    /// account key, not any one device. Empty on a legacy device, for the self-group, or when no foreign
+    /// member verifies (fail-safe: nothing to verify beats a wrong anchor).
+    #[wasm_bindgen(js_name = peerAccountKeys)]
+    pub fn peer_account_keys(&self, conversation_id: &str) -> Result<Vec<String>, JsError> {
+        self.peer_account_keys_inner(conversation_id).map_err(js)
+    }
+
     /// True iff every member of this conversation is one of OUR OWN account's devices (the hidden
     /// self-group that syncs our buddy list across our devices). Cryptographically grounded, so the client
     /// can hide it from the conversation list and target buddy-list syncs to it without a device-list cache.
@@ -809,6 +1037,14 @@ impl Conversation {
     #[wasm_bindgen(js_name = isSelfConversationStrict)]
     pub fn is_self_conversation_strict(&self, conversation_id: &str) -> Result<bool, JsError> {
         self.is_self_conversation_strict_inner(conversation_id).map_err(js)
+    }
+
+    /// READ-ONLY diagnostic: the reason a conversation is or is not a self-group ("self" when it is).
+    /// Makes no decision and grants no access; it exists so a stuck self-classification can be diagnosed
+    /// by reading the cause rather than guessing at MLS rosters the keyless gateway cannot show.
+    #[wasm_bindgen(js_name = selfClassificationReason)]
+    pub fn self_classification_reason_js(&self, conversation_id: &str) -> String {
+        self.self_classification_reason(conversation_id)
     }
 
     /// Whether OUR OWN current credential carries a verifying device certificate, i.e. a group minted
@@ -907,6 +1143,7 @@ impl Conversation {
             label: label.as_bytes().to_vec(),
             aak: None,
             account_floors: Vec::new(),
+            revocations: Vec::new(),
         })
     }
 
@@ -936,6 +1173,7 @@ impl Conversation {
             label: label.as_bytes().to_vec(),
             aak: Some(aak),
             account_floors,
+            revocations: Vec::new(),
         })
     }
 
@@ -943,11 +1181,27 @@ impl Conversation {
     /// same MLS signer (so the device key and bootstrap mailbox stay stable). Raises our trusted floor
     /// for our own account. Used by recovery and by the P6 epoch bump after a revoke.
     pub(crate) fn recredential_at_epoch_inner(&mut self, cert_epoch: u64) -> Result<(), String> {
-        let aak = self
-            .aak
-            .as_ref()
-            .ok_or_else(|| "this device has no account key to re-authorize with".to_string())?;
-        let aak_pub = authz::aak_public(aak);
+        // An honest device that has learned it was revoked stops here instead of re-minting a credential
+        // every device of this account (including itself) will refuse. NOT a security control: a device
+        // whose owner is the attacker runs whatever code it likes and can strip this check. What stops
+        // the attacker is check_added_leaf on the OTHER devices, which is why that gate, not this one,
+        // is the property the tests assert.
+        if self.is_revoked(self.signer.public()) {
+            return Err("this device was revoked by its account and cannot re-authorize".to_string());
+        }
+        let aak_pub = {
+            let aak = self
+                .aak
+                .as_ref()
+                .ok_or_else(|| "this device has no account key to re-authorize with".to_string())?;
+            authz::aak_public(aak)
+        };
+        // Never certify below what we last saw. Same rule and same reasoning as the scanned-device mint:
+        // raising is safe, lowering issues a credential our own gate would deny. The recovery path hands
+        // us the control plane's counter, which can lag our floor (or be deflated by a compelled server)
+        // and, until P7, could silently mint a doomed credential from the correct recovery secret.
+        let cert_epoch = cert_epoch.max(self.effective_floor(&aak_pub, 0));
+        let aak = self.aak.as_ref().expect("checked above");
         let cert = authz::sign_device_cert(aak, cert_epoch, self.signer.public());
         let identity = authz::encode_auth_identity(&aak_pub, cert_epoch, &cert, &self.label);
         self.credential = CredentialWithKey {
@@ -1039,6 +1293,13 @@ impl Conversation {
             .collect();
         // Legacy single `gid`/`trusted` are left EMPTY by this (multi-group) writer; all conversations
         // ride the trailing groups section. Old single-group blobs (legacy fields set) still load.
+        // The flush counters, so the cap is per EPOCH and not per page load (see encode_container).
+        let burns_ser: Vec<(Vec<u8>, u32, u64)> = self
+            .groups
+            .iter()
+            .filter(|(_, slot)| slot.flush_burns > 0)
+            .map(|(gid, slot)| (gid.clone(), slot.flush_burns, slot.flush_epoch))
+            .collect();
         let container = encode_container(
             &entries,
             &signer_bytes,
@@ -1050,6 +1311,8 @@ impl Conversation {
             &floors_ser,
             &groups_ser,
             &pendings_ser,
+            &burns_ser,
+            &self.revocations,
         )?;
         crate::atrest::seal(msk, &container)
     }
@@ -1059,7 +1322,7 @@ impl Conversation {
     /// receive ratchet, so a reload loads a stale ratchet; see honest-limits.
     pub(crate) fn from_sealed_inner(msk: &[u8], sealed: &[u8]) -> Result<Self, String> {
         let container = crate::atrest::open(msk, sealed)?;
-        let (entries, signer_bytes, label, gid, aak_seed, trusted, cred_identity, floors_raw, groups_raw, pendings_raw) =
+        let (entries, signer_bytes, label, gid, aak_seed, trusted, cred_identity, floors_raw, groups_raw, pendings_raw, burns_raw, revocations_raw) =
             decode_container(&container)?;
 
         let provider = OpenMlsRustCrypto::default();
@@ -1146,7 +1409,16 @@ impl Conversation {
                         2 => Some(Pending::Remove { commit: commit.clone(), removed: target.clone() }),
                         _ => None,
                     });
-                groups.insert(g, GroupSlot { group: loaded, trusted_aaks, pending });
+                // Restore the flush counter AND the epoch it was counted in, so the cap bounds the whole
+                // epoch and not just this page load. Absent (a blob written before this section) means a
+                // fresh count in epoch 0, which is the one case where restarting is legitimate; the epoch
+                // check at the point of use corrects it on the first flush anyway.
+                let (flush_burns, flush_epoch) = burns_raw
+                    .iter()
+                    .find(|(bg, _, _)| bg == &g)
+                    .map(|(_, n, e)| (*n, *e))
+                    .unwrap_or((0, 0));
+                groups.insert(g, GroupSlot { group: loaded, trusted_aaks, pending, flush_burns, flush_epoch });
             }
         }
         let mut restored = Self {
@@ -1157,7 +1429,22 @@ impl Conversation {
             label,
             aak,
             account_floors,
+            // Restored verbatim. These bytes came out of a container the AEAD already authenticated
+            // under our own MSK, so they are our own; and every one is re-verified at the point of USE
+            // (revoked_device_keys), which is the check that actually carries the property. Filtering
+            // here instead would silently and PERMANENTLY drop the denylist on any load where the
+            // credential has not settled yet (our_account_pub is None), which is exactly the moment a
+            // device is most exposed. Capped so a corrupt-but-authenticated blob cannot make the gate
+            // pay for an unbounded number of signature checks per add.
+            revocations: revocations_raw.into_iter().take(MAX_REVOCATIONS).collect(),
         };
+        // Re-derive the epoch floor from the records we hold. |S| is the DERIVED epoch: every device
+        // with the same record set computes the same number offline, so this survives a reload without
+        // asking the control plane, and a server that deflates its own counter cannot walk it back.
+        if let Some(our) = restored.our_account_pub() {
+            let derived = restored.revoked_device_keys().len() as u64;
+            restored.raise_floor(&our, derived);
+        }
         // MIGRATION BACKFILL: sealed blobs written by older builds on cert-only devices carry the
         // adopted credential alongside EMPTY per-group trusted sets (the old adopt gated the recompute
         // on holding the account PRIVATE key). Repopulate them at restore, idempotently, so the
@@ -1186,7 +1473,8 @@ impl Conversation {
         if self.groups.contains_key(&gid) {
             return Err("group id collision".to_string());
         }
-        self.groups.insert(gid.clone(), GroupSlot { group, trusted_aaks: Vec::new(), pending: None });
+        self.groups
+            .insert(gid.clone(), GroupSlot { group, trusted_aaks: Vec::new(), pending: None, flush_burns: 0, flush_epoch: 0 });
         // Anchor on our ACCOUNT (private key OR adopted cert), not the private key alone:
         // gather_roster_trusted verifies each member's cert self-contained, so a cert-only device can
         // and must record the formation-time trusted accounts too. Without this its trusted set stays
@@ -1280,6 +1568,96 @@ impl Conversation {
         conv_floor.max(global)
     }
 
+    /// The device signature keys this account has revoked, as proven by the records we hold. Derived
+    /// fresh from the stored blobs by re-verifying each one under OUR OWN account key, so there is no
+    /// cached set that could drift from the evidence, and a record we cannot verify (a different
+    /// account, a corrupted blob) contributes nothing instead of contributing a wrong answer.
+    ///
+    /// Cost is one Ed25519 verification per stored record per call. That is a handful of microseconds
+    /// each, on a list bounded by how many devices the user has ever revoked, on a path that runs when
+    /// a device is ADDED to a group. Caching it would trade a real correctness property for nothing.
+    fn revoked_device_keys(&self) -> Vec<Vec<u8>> {
+        if self.revocations.is_empty() {
+            return Vec::new(); // the common case: skip the credential parse entirely
+        }
+        let our = match self.our_account_pub() {
+            Some(a) => a,
+            None => return Vec::new(),
+        };
+        // DEDUPED BY TARGET. Two records naming the same device are legitimate (two seed-holders can
+        // revoke it concurrently, and they will pick different advisory sequence numbers, so the bytes
+        // differ). Counting both would inflate the derived epoch, which is defined as the number of
+        // devices this account has revoked; the set of excluded keys is what carries the meaning.
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        for blob in &self.revocations {
+            if let Some(target) = crate::revoke::verify_revocation(&our, blob) {
+                if !out.contains(&target) {
+                    out.push(target);
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether `device_sig_key` is one of OUR OWN account's revoked devices. False for any key we hold
+    /// no verifying record for, including every key belonging to a peer account: this denylist speaks
+    /// only for the account whose key signed it, and we only ever evaluate it for our own.
+    fn is_revoked(&self, device_sig_key: &[u8]) -> bool {
+        self.revoked_device_keys().iter().any(|k| k.as_slice() == device_sig_key)
+    }
+
+    /// Accept one signed revocation record. Returns true if it was new to this device.
+    ///
+    /// This is the ONLY entry point into the denylist, and it is fail-closed in the direction that
+    /// matters: an unverifiable blob is rejected outright rather than stored "in case", so no amount of
+    /// junk from the control plane can grow the list or slow the gate. Records are append-only and
+    /// deduped by exact bytes.
+    ///
+    /// Accepting a record also raises our epoch floor to the number of records we now hold. That count
+    /// is the DERIVED epoch: every device with the same record set computes the same number without
+    /// asking anyone, so the floor stops being a server-supplied counter that a compelled control plane
+    /// could deflate, and becomes a function of evidence both sides can check. It stays a lower bound
+    /// (it defends cert-only devices against credential rollback); exclusion is the denylist's job.
+    pub(crate) fn ingest_revocation_inner(&mut self, blob: &[u8]) -> Result<bool, String> {
+        let our = self
+            .our_account_pub()
+            .ok_or_else(|| "this device has no account identity to check a revocation against".to_string())?;
+        if crate::revoke::verify_revocation(&our, blob).is_none() {
+            return Err("revocation record did not verify under this account's key".to_string());
+        }
+        if self.revocations.iter().any(|r| r.as_slice() == blob) {
+            return Ok(false);
+        }
+        if self.revocations.len() >= MAX_REVOCATIONS {
+            return Err("this account is at its revocation record limit".to_string());
+        }
+        self.revocations.push(blob.to_vec());
+        let derived = self.revoked_device_keys().len() as u64;
+        self.raise_floor(&our, derived);
+        Ok(true)
+    }
+
+    /// Seed-holder: issue a revocation record for `device_sig_key` and adopt it locally. Returns the
+    /// record as hex for the caller to publish, so every other device of this account learns it.
+    ///
+    /// Refusing to revoke our OWN key is deliberate. This device would immediately deny itself at its
+    /// own gate and could never be re-admitted, and it is the device holding the account key, so the
+    /// record it just wrote would be the last thing it ever authored. Revoking the current device is a
+    /// separate, server-side flow that ends in a wipe.
+    pub(crate) fn revoke_device_inner(&mut self, device_sig_key_hex: &str, issued_seq: u64) -> Result<String, String> {
+        let target = hex_to_bytes(device_sig_key_hex)?;
+        if target.as_slice() == self.signer.public() {
+            return Err("a device cannot revoke itself".to_string());
+        }
+        let aak = self
+            .aak
+            .as_ref()
+            .ok_or_else(|| "this device cannot revoke others (no account key)".to_string())?;
+        let record = crate::revoke::sign_revocation(aak, &target, issued_seq)?;
+        self.ingest_revocation_inner(&record)?;
+        Ok(hex(&record))
+    }
+
     /// Recompute one conversation's trusted account-key set from its roster: an account is trusted iff
     /// at least one of its devices in that group presents a credential whose AAK certificate verifies
     /// over that device's signature key. Called only when establishing the conversation (create or
@@ -1313,8 +1691,54 @@ impl Conversation {
             .group
             .create_message(&self.provider, &self.signer, plaintext)
             .map_err(|e| format!("encrypt: {e:?}"))?;
+        // NOTE: a real send does NOT refill the flush budget, deliberately. What keeps us inside the
+        // peer's window is the generation THE PEER HAS RECEIVED, and our own encrypt establishes no such
+        // thing: the message may never be delivered, may be dropped, may sit undelivered for days. An
+        // earlier cut reset the counter here, which meant a device could refill its budget indefinitely
+        // by sending into the void. An epoch change (a membership commit) is the only thing that
+        // genuinely resets the peer's expectations, and it is where the refill happens: see the epoch
+        // check in flush_receive_ratchet_inner.
         out.tls_serialize_detached()
             .map_err(|e| format!("serialize message: {e:?}"))
+    }
+
+    /// Persist the ADVANCED receive ratchet for one conversation, so a device seized powered-off does
+    /// not hand over the keys to messages it has already processed.
+    ///
+    /// Why this exists: OpenMLS writes its message secrets when it ENCRYPTS or merges a commit, never
+    /// when it decrypts. Processing an inbound message advances the ratchet in memory only, so the
+    /// sealed at-rest blob keeps a snapshot from the last send or commit. From that snapshot every
+    /// application message any member sent in the current epoch is re-derivable, which is exactly the
+    /// exposure honest-limits item 10 describes. There is no public "flush" in OpenMLS 0.6, but
+    /// encrypting is a flush: we build one message, throw the ciphertext away, and the advanced state
+    /// lands in provider storage where export_sealed will pick it up.
+    ///
+    /// The cost is one of OUR send generations per call. A peer refuses a generation jump beyond its
+    /// forward distance, so the budget is capped PER EPOCH: generations restart at 0 when the group
+    /// advances, so a membership change refills it, while a plain send does not (see encrypt_inner).
+    /// Returns false when this epoch's budget is spent, so the caller can stop re-sealing for nothing.
+    pub(crate) fn flush_receive_ratchet_inner(&mut self, gid_hex: &str) -> Result<bool, String> {
+        let gid = hex_to_bytes(gid_hex)?;
+        let slot = self
+            .groups
+            .get_mut(&gid)
+            .ok_or_else(|| "no such conversation".to_string())?;
+        // Refill on an epoch change, checked HERE rather than at each commit-merge site: there are eight
+        // of them (own commit, merged peer commit, staged confirm, self-heal, ...) and one missed site
+        // would silently reinstate the lifetime cap. Reading the epoch at the point of use cannot miss one.
+        let epoch = slot.group.epoch().as_u64();
+        if slot.flush_epoch != epoch {
+            slot.flush_epoch = epoch;
+            slot.flush_burns = 0;
+        }
+        if slot.flush_burns >= FLUSH_BURN_BUDGET {
+            return Ok(false);
+        }
+        slot.group
+            .create_message(&self.provider, &self.signer, b"")
+            .map_err(|e| format!("flush: {e:?}"))?;
+        slot.flush_burns += 1;
+        Ok(true)
     }
 
     fn decrypt_inner(&mut self, gid_hex: &str, ciphertext: &[u8]) -> Result<Vec<u8>, String> {
@@ -1390,9 +1814,15 @@ impl Conversation {
             if !verify_device_cert(&ai.aak_pub, ai.cert_epoch, &sigkey, &ai.cert) {
                 return Err("self-group member certificate did not verify".to_string());
             }
-            // The FLOOR half of the gate this mirrors (check_added_leaf): a revoked device's leftover
-            // pre-revoke package verifies fine, and only the device-local anti-rollback floor catches
-            // it when the directory (an untrusted party) serves it anyway.
+            // The DENYLIST half of the gate this mirrors (check_added_leaf). Load-bearing here in its
+            // own right: the self-group carries the contact graph, so admitting a revoked device would
+            // hand the whole buddy list to a device the user has already thrown out.
+            if self.is_revoked(&sigkey) {
+                return Err("self-group member was revoked by this account".to_string());
+            }
+            // The FLOOR half: a revoked device's leftover pre-revoke package verifies fine, and only the
+            // device-local anti-rollback floor catches it when the directory (an untrusted party) serves
+            // it anyway. Still a lower bound, so it backs up the denylist rather than replacing it.
             if ai.cert_epoch < self.effective_floor(&ai.aak_pub, 0) {
                 return Err("self-group member certificate epoch below floor".to_string());
             }
@@ -1425,6 +1855,7 @@ impl Conversation {
             Some(ai) => {
                 ai.aak_pub == our
                     && verify_device_cert(&ai.aak_pub, ai.cert_epoch, &sigkey, &ai.cert)
+                    && !self.is_revoked(&sigkey)
                     && ai.cert_epoch >= self.effective_floor(&ai.aak_pub, 0)
             }
             None => false,
@@ -1843,11 +2274,28 @@ impl Conversation {
         if !verify_device_cert(&ai.aak_pub, ai.cert_epoch, sigkey, &ai.cert) {
             return Err("unauthorized device: certificate did not verify".to_string());
         }
+        // ADR-022 P7, THE EXCLUSION CHECK. Ordered before the epoch compare on purpose: the epoch is a
+        // lower bound and a revoked SEED-HOLDER sails over any floor by re-certifying itself at a number
+        // of its choosing (it still has the seed on its own disk; revocation is a server-side act that
+        // cannot reach it). Only naming the device excludes it. Scoped to OUR OWN account because a
+        // record signed by our account key says nothing about a peer's devices, and we hold no authority
+        // over those.
+        if self.our_account_pub().as_deref() == Some(ai.aak_pub.as_slice()) && self.is_revoked(sigkey) {
+            return Err("unauthorized device: revoked by this account".to_string());
+        }
         let conv_floor = trusted.iter().find(|(k, _)| k == &ai.aak_pub).map(|(_, e)| *e);
         match conv_floor {
             Some(conv_floor) => {
-                if ai.cert_epoch < self.effective_floor(&ai.aak_pub, conv_floor) {
-                    return Err("unauthorized device: certificate epoch below floor".to_string());
+                let floor = self.effective_floor(&ai.aak_pub, conv_floor);
+                if ai.cert_epoch < floor {
+                    // Carry the NUMBERS. Without them this rejection is opaque: the app can only say
+                    // "could not add the new device", and diagnosing a stuck pairing means guessing at
+                    // three invisible values (the leaf's epoch, this conversation's floor, and this
+                    // device's global high-water). They are not secret; they are counters.
+                    return Err(format!(
+                        "unauthorized device: certificate epoch below floor (leaf epoch {}, floor {}, conversation floor {})",
+                        ai.cert_epoch, floor, conv_floor
+                    ));
                 }
             }
             None => return Err("unauthorized device: unknown account key".to_string()),
@@ -2034,6 +2482,54 @@ impl Conversation {
         Ok(())
     }
 
+    /// SG2 SELF-HEAL: abandon a self-group that is provably DEAD, so a poisoned one cannot strand the
+    /// account forever. close_conversation_inner deliberately REFUSES to close an own-devices group (a
+    /// mis-timed classification must never permanently delete it), which is correct — but it also made
+    /// the one unrecoverable state unrecoverable BY THE APP: a self-group holding a frozen certless leaf
+    /// can never be repaired in place (MLS never rewrites a leaf credential), never syncs, and the user
+    /// had to close it by hand on every device.
+    ///
+    /// This path is deliberately NARROW, and refuses unless ALL of the following hold, so it can never
+    /// become a way to delete a healthy self-group:
+    ///   1. we hold an account anchor (otherwise we cannot classify anything: fail closed);
+    ///   2. `recorded_self` — the CALLER's durable record that this id is one of its own-devices groups.
+    ///      This layer genuinely CANNOT derive that: a peer conversation minted while the peer's leaf was
+    ///      still certless is byte-for-byte indistinguishable here from a poisoned self-group (both trust
+    ///      only our account and hold one certless member), so deriving it would silently drop a real
+    ///      pending peer chat. A test pins exactly that case. The client keeps the recorded set;
+    ///   3. the group trusts ONLY our account (formation-time), the crypto-verifiable half of (2);
+    ///   4. it is UNLINKED: no member verifies under any account, i.e. it provably has no reachable
+    ///      recipient. A self-group with even ONE verified sibling is alive and is REFUSED.
+    /// Returns true when it abandoned the group, false when the group was unknown (idempotent).
+    pub(crate) fn abandon_dead_self_group_inner(&mut self, gid_hex: &str, recorded_self: bool) -> Result<bool, String> {
+        if !recorded_self {
+            return Err("not a recorded own-devices group".to_string());
+        }
+        let gid = hex_to_bytes(gid_hex)?;
+        if !self.groups.contains_key(&gid) {
+            return Ok(false); // idempotent: nothing to abandon
+        }
+        let our = self
+            .our_account_pub()
+            .ok_or_else(|| "cannot abandon while this device's authorization is unsettled".to_string())?;
+        {
+            let slot = self.groups.get(&gid).ok_or_else(|| "no such conversation".to_string())?;
+            // Ours: formed trusting ONLY our account. Anything else is a peer conversation.
+            let ours = !slot.trusted_aaks.is_empty() && slot.trusted_aaks.iter().all(|(k, _)| k == &our);
+            if !ours {
+                return Err("not an own-devices group".to_string());
+            }
+        }
+        // Dead: no member verifies anywhere. A single verified sibling means it still works, so refuse.
+        if !self.channel_unlinked_inner(gid_hex)? {
+            return Err("this own-devices group is still reachable".to_string());
+        }
+        if let Some(mut slot) = self.groups.remove(&gid) {
+            let _ = slot.group.delete(self.provider.storage());
+        }
+        Ok(true)
+    }
+
     pub(crate) fn channel_unlinked_inner(&self, gid_hex: &str) -> Result<bool, String> {
         let gid = hex_to_bytes(gid_hex)?;
         let slot = self
@@ -2066,6 +2562,44 @@ impl Conversation {
             }
         }
         Ok(certless_other)
+    }
+
+    /// The distinct foreign account authority keys among CURRENT members whose certs verify, hex-sorted.
+    /// A member with no cert or a non-verifying cert contributes nothing: a forged credential must never
+    /// become the key a person is asked to verify. Own-account members (including our own leaf) are
+    /// excluded, so the self-group and our siblings inside a peer conversation both yield nothing.
+    pub(crate) fn peer_account_keys_inner(&self, gid_hex: &str) -> Result<Vec<String>, String> {
+        let gid = hex_to_bytes(gid_hex)?;
+        let slot = self
+            .groups
+            .get(&gid)
+            .ok_or_else(|| "no such conversation".to_string())?;
+        let our_aak = match self.our_account_pub() {
+            Some(a) => a,
+            None => return Ok(Vec::new()), // fail-safe: a legacy device cannot anchor verification
+        };
+        let own = slot.group.own_leaf_index();
+        let mut out: Vec<String> = Vec::new();
+        for m in slot.group.members() {
+            if m.index == own {
+                continue;
+            }
+            let verified = BasicCredential::try_from(m.credential.clone())
+                .ok()
+                .and_then(|bc| parse_auth_identity(&bc.identity().to_vec()))
+                .filter(|ai| verify_device_cert(&ai.aak_pub, ai.cert_epoch, &m.signature_key, &ai.cert));
+            if let Some(ai) = verified {
+                if ai.aak_pub == our_aak {
+                    continue;
+                }
+                let h = hex(&ai.aak_pub);
+                if !out.contains(&h) {
+                    out.push(h);
+                }
+            }
+        }
+        out.sort();
+        Ok(out)
     }
 
     pub(crate) fn credential_certified_inner(&self) -> bool {
@@ -2145,6 +2679,58 @@ impl Conversation {
         Ok(any)
     }
 
+    /// READ-ONLY diagnostic: WHY a conversation is or is not classified as our own-devices self-group.
+    /// Mirrors classify_self exactly (lenient mode: our own leaf is exempt), returning a short,
+    /// non-sensitive reason string instead of a bool. It CANNOT weaken the privacy guard: it makes no
+    /// decision and grants no access; it only names the first member or condition that fails, so a stuck
+    /// pairing can be diagnosed by READING the cause instead of guessing at rosters the keyless gateway
+    /// cannot show. "self" means every check passed. Never emits key bytes (only member indices).
+    fn self_classification_reason(&self, gid_hex: &str) -> String {
+        let gid = match hex_to_bytes(gid_hex) {
+            Ok(g) => g,
+            Err(_) => return "bad conversation id".to_string(),
+        };
+        let slot = match self.groups.get(&gid) {
+            Some(s) => s,
+            None => return "no such conversation".to_string(),
+        };
+        let our_aak = match self.our_account_pub() {
+            Some(a) => a,
+            None => return "this device has no account anchor (cert not settled)".to_string(),
+        };
+        // Mirror classify_self's control flow EXACTLY: it does not special-case an empty trusted set. An
+        // empty set makes the `.all()` conjunct vacuously true (the documented cert-only-with-departed-
+        // peer residual), so classify_self proceeds to the member checks and may still classify self via
+        // the own-leaf exemption. An earlier draft early-returned "trusted set empty" here, which
+        // DIVERGED from the real decision in that window (the diagnostic said not-self while the group
+        // behaved as self). The divergence was in the safe direction, but a diagnostic must not lie about
+        // the decision it is diagnosing, so it follows the same path and only names a member that fails.
+        if !slot.trusted_aaks.iter().all(|(k, _)| k == &our_aak) {
+            return "trusted set includes a foreign account (formed with a peer)".to_string();
+        }
+        let own = slot.group.own_leaf_index();
+        for m in slot.group.members() {
+            if m.index == own {
+                continue; // own-leaf exemption, same as classify_self lenient mode
+            }
+            let identity = match BasicCredential::try_from(m.credential.clone()) {
+                Ok(bc) => bc.identity().to_vec(),
+                Err(_) => return format!("member {} has an unreadable credential", m.index),
+            };
+            match parse_auth_identity(&identity) {
+                None => return format!("member {} has no certificate (legacy/label-only leaf)", m.index),
+                Some(ai) if ai.aak_pub != our_aak => {
+                    return format!("member {} belongs to a different account", m.index);
+                }
+                Some(ai) if !verify_device_cert(&ai.aak_pub, ai.cert_epoch, &m.signature_key, &ai.cert) => {
+                    return format!("member {} certificate does not verify (epoch {})", m.index, ai.cert_epoch);
+                }
+                Some(_) => {}
+            }
+        }
+        "self".to_string()
+    }
+
     /// Seed-holder path (ADR-022 P4, provisioning model b): authorize ANOTHER device by signing a
     /// certificate over its signature key at `cert_epoch`. GUARD: recompute the verification-code
     /// digest over the session nonce, this account's key, the key we are about to sign, and the
@@ -2166,6 +2752,25 @@ impl Conversation {
         let device_key = hex_to_bytes(device_sig_key_hex)?;
         let nonce = hex_to_bytes(session_nonce_hex)?;
         let confirmed = hex_to_bytes(confirmed_sas_hex)?;
+        // Never re-certify a device this account has revoked. Its key would be denied at our own gate
+        // (check_added_leaf), so issuing the certificate would only produce a device that believes it is
+        // authorized and can never join anything. A revoked device comes back as a NEW device with a new
+        // key, which is what the pairing flow produces anyway.
+        if self.is_revoked(&device_key) {
+            return Err("that device was revoked; pair it as a new device instead".to_string());
+        }
+        // Same floor backstop as the scanned path: a certificate below the account floor is dead on
+        // arrival. Checked BEFORE the SAS compare so a caller that got the epoch wrong is told so
+        // plainly, rather than being sent to fix six words that were never the problem. This path
+        // ERRORS rather than clamping, unlike the scanned path: the six-word digest is computed over
+        // cert_epoch on BOTH sides, so silently raising it here would break the very compare that makes
+        // the ceremony safe.
+        let floor = self.effective_floor(&authz::aak_public(aak), 0);
+        if cert_epoch < floor {
+            return Err(format!(
+                "refusing to certify below this account's floor (epoch {cert_epoch} < floor {floor})"
+            ));
+        }
         let sas = authz::sas_digest(&nonce, &authz::aak_public(aak), &device_key, cert_epoch);
         if sas.as_slice() != confirmed.as_slice() {
             return Err("authorization does not match the confirmed verification code".to_string());
@@ -2185,6 +2790,30 @@ impl Conversation {
         if device_sig_key.len() != 32 {
             return Err("device signature key must be 32 bytes".to_string());
         }
+        // Never re-certify a key this account has revoked: our own gate denies it by identity now, so
+        // the certificate would authorize a device that can never join anything. A device the user wants
+        // back rejoins as a NEW device with a fresh key, which is what a re-scan produces.
+        if self.is_revoked(device_sig_key) {
+            return Err("that device was revoked; pair it as a new device instead".to_string());
+        }
+        // Never mint a certificate our OWN gate would refuse. check_added_leaf rejects a leaf whose
+        // cert_epoch is below the account floor, and the floor only rises (raise_floor), so a cert
+        // minted below it is dead the instant the new device is staged into any group: pairing reports
+        // success, the server row is created, and the add fails forever with no way back. The caller
+        // hard-coded 0 here for a long time, which bricked every pairing on any account that had ever
+        // revoked a device.
+        //
+        // CERTIFY AT THE FLOOR rather than erroring. Erroring was the first fix and it is wrong on this
+        // path: the caller's epoch comes from the control plane's account counter, our floor is device
+        // -local, and any disagreement between the two blocks pairing outright with nothing the user can
+        // do about it. Raising is always SAFE (the epoch is a lower bound, so a higher one is strictly
+        // more restrictive) and it is the "refuse to certify below what we last saw" rule stated
+        // constructively: we never sign below our floor, and we never mint a credential we would deny.
+        // The Grant carries the epoch we actually used, so the new device adopts this number, not the
+        // one that was asked for. Exclusion does not ride on this value any more; the denylist above
+        // does, which is why inflating it here costs nothing.
+        let floor = self.effective_floor(&authz::aak_public(aak), 0);
+        let cert_epoch = cert_epoch.max(floor);
         let cert = authz::sign_device_cert(aak, cert_epoch, device_sig_key);
         let mut out = Vec::with_capacity(32 + 8 + 64);
         out.extend_from_slice(&authz::aak_public(aak));
@@ -2799,7 +3428,7 @@ mod tests {
             credential: BasicCredential::new(identity).into(),
             signature_key: signer.public().into(),
         };
-        crate::fresh_key_package_bytes(provider, &signer, cwk).unwrap()
+        crate::fresh_key_package_bytes(provider, &signer, cwk, false).unwrap()
     }
 
     #[test]
@@ -2813,6 +3442,236 @@ mod tests {
         assert_eq!(a.groups.values().next().unwrap().trusted_aaks.len(), 2);
         assert_eq!(b.groups.values().next().unwrap().trusted_aaks.len(), 2);
         assert_eq!(a.account_key_hex().len(), 64);
+    }
+
+    #[test]
+    fn peer_account_keys_sees_exactly_the_other_account_from_both_ends() {
+        let (a, b, _, _) = authorized_pair();
+        let ga = sole_gid(&a);
+        let gb = sole_gid(&b);
+        let from_a = a.peer_account_keys_inner(&ga).unwrap();
+        let from_b = b.peer_account_keys_inner(&gb).unwrap();
+        assert_eq!(from_a.len(), 1);
+        assert_eq!(from_b.len(), 1);
+        assert_eq!(from_a[0], b.account_key_hex());
+        assert_eq!(from_b[0], a.account_key_hex());
+        // Each side's view of the OTHER's key digests to exactly what that other side renders for
+        // itself, which is what makes the two halves comparable over the phone.
+        assert_eq!(
+            authz::contact_ident_digest(&hex_to_bytes(&from_a[0]).unwrap()),
+            authz::contact_ident_digest(&hex_to_bytes(&b.account_key_hex()).unwrap())
+        );
+        assert_eq!(
+            authz::contact_ident_digest(&hex_to_bytes(&from_b[0]).unwrap()),
+            authz::contact_ident_digest(&hex_to_bytes(&a.account_key_hex()).unwrap())
+        );
+    }
+
+    #[test]
+    fn peer_account_keys_ignores_own_siblings_and_the_self_group() {
+        let (mut a, b, a_seed, _) = authorized_pair();
+        let ga = sole_gid(&a);
+        // A adds its own second device to the peer conversation: still exactly one FOREIGN account.
+        let a2 = Conversation::new_authorized_inner("a-phone", &a_seed).unwrap();
+        let (_commit, _welcome) = a.add_member_inner(&ga, &a2.key_package().unwrap()).unwrap();
+        let keys = a.peer_account_keys_inner(&ga).unwrap();
+        assert_eq!(keys, vec![b.account_key_hex()]);
+        // A solo self-group has no foreign members at all.
+        let mut solo = Conversation::new_authorized_inner("solo", &[7u8; 32]).unwrap();
+        let gid = solo.create_self_inner().unwrap();
+        let g = hex(&gid);
+        assert_eq!(solo.peer_account_keys_inner(&g).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn peer_account_keys_excludes_a_forged_certificate() {
+        // A member whose credential CLAIMS an account key but whose cert does not verify must not
+        // surface as a verification anchor: pinning a forged key would bless the attacker.
+        let (mut a, _b, _, _) = authorized_pair();
+        let ga = sole_gid(&a);
+        let before = a.peer_account_keys_inner(&ga).unwrap();
+        let provider = OpenMlsRustCrypto::default();
+        let claimed = [42u8; 32];
+        let kp = forged_authorized_kp(&provider, &claimed);
+        // The add gate itself refuses the forged member; either way the claimed key never appears.
+        let _ = a.add_member_inner(&ga, &kp);
+        let after = a.peer_account_keys_inner(&ga).unwrap();
+        assert_eq!(before, after);
+        assert!(!after.contains(&hex(&claimed)));
+    }
+
+    #[test]
+    fn flushing_the_receive_ratchet_makes_processed_messages_unrecoverable_after_reload() {
+        // The exposure: OpenMLS persists message secrets on SEND, never on receive, so a sealed blob
+        // taken from a powered-off device still derives the keys for messages the device already read.
+        let msk = [9u8; 32];
+        let (mut a, mut b, _, _) = authorized_pair();
+        let ga = sole_gid(&a);
+        let gb = sole_gid(&b);
+        let ct = b.encrypt_inner(&gb, b"the meeting is at noon").unwrap();
+        assert_eq!(a.decrypt_inner(&ga, &ct).unwrap(), b"the meeting is at noon");
+
+        // WITHOUT a flush: seal, reload, and the already-read ciphertext decrypts again.
+        let stale = a.export_sealed_inner(&msk).unwrap();
+        let mut reloaded = Conversation::from_sealed_inner(&msk, &stale).unwrap();
+        assert!(
+            reloaded.decrypt_inner(&ga, &ct).is_ok(),
+            "precondition: the un-flushed blob still recovers a processed message"
+        );
+
+        // WITH a flush before sealing: the stored ratchet is past that message and it is gone.
+        assert!(a.flush_receive_ratchet_inner(&ga).unwrap());
+        let flushed = a.export_sealed_inner(&msk).unwrap();
+        let mut after = Conversation::from_sealed_inner(&msk, &flushed).unwrap();
+        assert!(
+            after.decrypt_inner(&ga, &ct).is_err(),
+            "a flushed blob must not recover a message the device already processed"
+        );
+    }
+
+    #[test]
+    #[ignore] // timing probe, run with: cargo test perf_reseal -- --ignored --nocapture
+    fn perf_reseal_cost_by_conversation_count() {
+        use std::time::Instant;
+        let msk = [4u8; 32];
+        for n in [1usize, 5, 20, 50] {
+            let mut a = Conversation::new_authorized_inner("a", &[10u8; 32]).unwrap();
+            for i in 0..n {
+                let b = Conversation::new_authorized_inner("b", &[(20 + i) as u8; 32]).unwrap();
+                a.create_group_inner(&[b.key_package().unwrap()]).unwrap();
+            }
+            // A little traffic so the storage map is not empty.
+            let gids: Vec<String> = a.groups.keys().map(|g| hex(g)).collect();
+            for g in &gids {
+                for _ in 0..5 {
+                    a.encrypt_inner(g, b"some traffic").unwrap();
+                }
+            }
+            let t = Instant::now();
+            let blob = a.export_sealed_inner(&msk).unwrap();
+            let seal_us = t.elapsed().as_micros();
+            let t2 = Instant::now();
+            let _ = Conversation::from_sealed_inner(&msk, &blob).unwrap();
+            let load_us = t2.elapsed().as_micros();
+            println!("conversations={n:3}  blob={:7} bytes  seal={seal_us:6}us  load={load_us:6}us", blob.len());
+        }
+    }
+
+    #[test]
+    fn the_flush_budget_survives_reload_so_a_lurker_never_drifts_past_a_peer() {
+        // The defect: flush_burns lived only in memory while the send generation rode along inside the
+        // sealed blob, so the cap was really "per page load". Six sessions of a device that only ever
+        // LISTENS pushed its generation past the peer's forward-distance window (1000), and its eventual
+        // first real message became undecryptable by everyone, silently and permanently.
+        let msk = [3u8; 32];
+        let (mut a, mut b, _, _) = authorized_pair();
+        let ga = sole_gid(&a);
+        let gb = sole_gid(&b);
+        for _ in 0..6 {
+            while a.flush_receive_ratchet_inner(&ga).unwrap() {}
+            let sealed = a.export_sealed_inner(&msk).unwrap();
+            a = Conversation::from_sealed_inner(&msk, &sealed).unwrap();
+        }
+        // After six reloads the budget is still spent, not refreshed six times over.
+        assert!(!a.flush_receive_ratchet_inner(&ga).unwrap(), "the cap must survive a reload");
+        // And the peer can still read us, which is what the cap exists to guarantee.
+        let ct = a.encrypt_inner(&ga, b"still reachable after six reloads").unwrap();
+        assert_eq!(b.decrypt_inner(&gb, &ct).unwrap(), b"still reachable after six reloads");
+    }
+
+    #[test]
+    fn the_flush_budget_is_bounded_per_epoch_and_a_send_does_not_refill_it() {
+        // Each flush spends one of our send generations; a peer refuses too large a jump, so the budget
+        // is capped. It is capped PER EPOCH: a send must not refill it, because our own encrypt proves
+        // nothing about what the peer has RECEIVED, so a device could otherwise refill indefinitely by
+        // sending into the void and still drift past the peer's window.
+        //
+        // The per-epoch half of that used to be aspiration: nothing reset the counter, so the cap was
+        // really per group LIFETIME, and after 200 flushes the at-rest protection silently switched
+        // itself off forever. This test earlier asserted only the send half, which is how the name
+        // stayed true while the code was not. Both halves are asserted now.
+        let (mut a, _b, _, _) = authorized_pair();
+        let ga = sole_gid(&a);
+        for i in 0..FLUSH_BURN_BUDGET {
+            assert!(a.flush_receive_ratchet_inner(&ga).unwrap(), "flush {i} must be allowed");
+        }
+        assert!(!a.flush_receive_ratchet_inner(&ga).unwrap(), "the budget must stop the next flush");
+        a.encrypt_inner(&ga, b"a real message").unwrap();
+        assert!(!a.flush_receive_ratchet_inner(&ga).unwrap(), "a send must NOT buy the budget back");
+    }
+
+    #[test]
+    fn an_epoch_change_refills_the_flush_budget_but_a_reload_inside_one_epoch_does_not() {
+        // Generations restart at 0 in a new epoch, so the peer's forward-distance window resets with it
+        // and a fresh budget is safe. Without this the counter only ever rose and a long-lived
+        // conversation permanently lost the protection. The second half is the trap that was already
+        // fixed once: the refill must come from the EPOCH advancing, never from a page reload.
+        let msk = [9u8; 32];
+        let (mut a, mut b, mut c) = established_group_3();
+        let ga = sole_gid(&a);
+        let gb = sole_gid(&b);
+        while a.flush_receive_ratchet_inner(&ga).unwrap() {}
+        assert!(!a.flush_receive_ratchet_inner(&ga).unwrap(), "spent");
+
+        // A reload inside the SAME epoch must not hand the budget back.
+        let sealed = a.export_sealed_inner(&msk).unwrap();
+        let mut a = Conversation::from_sealed_inner(&msk, &sealed).unwrap();
+        assert!(!a.flush_receive_ratchet_inner(&ga).unwrap(), "a reload must NOT refill inside one epoch");
+
+        // A membership commit advances the epoch, and now it must.
+        let commit = a.remove_member_inner(&ga, &c.signature_public_key_hex()).unwrap();
+        b.receive_inner(&commit).unwrap();
+        c.receive_inner(&commit).unwrap();
+        assert!(a.flush_receive_ratchet_inner(&ga).unwrap(), "a new epoch must refill the budget");
+
+        // And spending the fresh budget still leaves us inside the peer's window.
+        while a.flush_receive_ratchet_inner(&ga).unwrap() {}
+        let ct = a.encrypt_inner(&ga, b"readable after a refilled budget").unwrap();
+        assert_eq!(b.decrypt_inner(&gb, &ct).unwrap(), b"readable after a refilled budget");
+    }
+
+    #[test]
+    fn a_flushed_sender_is_still_readable_by_its_peer() {
+        // The whole budget must not push our send generation past what a peer will accept.
+        let (mut a, mut b, _, _) = authorized_pair();
+        let ga = sole_gid(&a);
+        let gb = sole_gid(&b);
+        for _ in 0..FLUSH_BURN_BUDGET {
+            a.flush_receive_ratchet_inner(&ga).unwrap();
+        }
+        let ct = a.encrypt_inner(&ga, b"still reachable").unwrap();
+        assert_eq!(b.decrypt_inner(&gb, &ct).unwrap(), b"still reachable");
+    }
+
+    #[test]
+    fn contact_ident_digest_is_per_key_stable_and_distinct() {
+        let k1 = [1u8; 32];
+        let k2 = [2u8; 32];
+        // Stable: the same key always renders the same words, so two people can compare at any time.
+        assert_eq!(authz::contact_ident_digest(&k1), authz::contact_ident_digest(&k1));
+        // Distinct per key: a substituted account key produces different words on the other screen.
+        assert_ne!(authz::contact_ident_digest(&k1), authz::contact_ident_digest(&k2));
+        // The digest depends on the key throughout, not only on the first block: flipping the LAST
+        // byte changes it (a chain that dropped the key after round 0 would not catch this).
+        let mut k3 = k1;
+        k3[31] ^= 0x01;
+        assert_ne!(authz::contact_ident_digest(&k1), authz::contact_ident_digest(&k3));
+    }
+
+    #[test]
+    fn a_man_in_the_middle_cannot_make_both_sides_show_the_same_words() {
+        // The attack the pairwise design lost to: Mallory picks BOTH substituted keys. Per side, each
+        // honest key is a FIXED target, so the halves Alice and Bob read to each other differ unless
+        // Mallory second-preimages each one.
+        let (a, b, _, _) = authorized_pair();
+        let a_key = hex_to_bytes(&a.account_key_hex()).unwrap();
+        let b_key = hex_to_bytes(&b.account_key_hex()).unwrap();
+        let m1 = [0xAAu8; 32]; // shown to Alice in place of Bob
+        let m2 = [0xBBu8; 32]; // shown to Bob in place of Alice
+        // What Alice reads out (her own) vs what Bob expects for her (the key he was handed).
+        assert_ne!(authz::contact_ident_digest(&a_key), authz::contact_ident_digest(&m2));
+        // What Bob reads out vs what Alice was handed for him.
+        assert_ne!(authz::contact_ident_digest(&b_key), authz::contact_ident_digest(&m1));
     }
 
     #[test]
@@ -3254,6 +4113,253 @@ mod tests {
     fn a_device_without_the_account_key_cannot_qr_authorize_others() {
         let d2 = Conversation::new_inner("d2").unwrap();
         assert!(d2.authorize_scanned_device_inner(&[9u8; 32], 0).is_err());
+    }
+
+    #[test]
+    fn a_revoked_seed_holder_cannot_recertify_its_way_back_in() {
+        // THE ATTACK UNDER TEST. Revocation is a SERVER-SIDE act: it burns a directory row, kills the
+        // sessions and deletes the key packages. It cannot reach the revoked device's own disk, where its
+        // copy of the ACCOUNT seed still sits (aak_seed in the sealed container). The floor is only a
+        // LOWER BOUND, and recredential_at_epoch_inner signs whatever epoch it is handed with no ceiling
+        // (reauthorize_at_epoch exposes it to JS unbounded). So the revoked device should be able to
+        // re-certify ITSELF at an absurd epoch, sail over any floor, and be re-admitted by an honest
+        // device that has correctly raised its own floor. If it can, exclusion by epoch does not work.
+        let seed = [42u8; 32]; // ONE account: both devices derive the SAME account key from it
+        let honest = Conversation::new_authorized_inner("honest", &seed).unwrap();
+        let evil = Conversation::new_authorized_inner("evil", &seed).unwrap();
+        let evil_sig = evil.signature_public_key_hex();
+
+        // They share a conversation, so `honest` trusts the account and knows the roster.
+        let mut honest = honest;
+        let (welcome, _g) = honest.create_group_inner(&[evil.key_package().unwrap()]).unwrap();
+        let mut evil = evil;
+        evil.join_from_welcome_inner(&welcome).unwrap();
+        let g = sole_gid(&honest);
+        assert_eq!(honest.roster_hex_inner(&g).unwrap().len(), 2, "both devices are in the group");
+
+        // The user revokes `evil`. The honest device removes it from the group, ISSUES A SIGNED
+        // REVOCATION RECORD naming evil's key (ADR-022 P7), and re-certifies itself at the account's new
+        // epoch. All three are what the app does on a revoke; the record is the part that carries the
+        // authorization decision, the other two are hygiene.
+        let commit = honest.remove_member_inner(&g, &evil_sig).unwrap();
+        evil.receive_inner(&commit).unwrap(); // evil observes its own eviction
+        honest.revoke_device_inner(&evil_sig, 1).unwrap();
+        honest.recredential_at_epoch_inner(1).unwrap(); // the post-revoke floor raise
+        assert_eq!(honest.roster_hex_inner(&g).unwrap().len(), 1, "evil is out of the group");
+
+        // THE ATTACK: evil still holds the account seed on its own disk. It re-certifies itself at an
+        // epoch far above anything the honest device will ever reach, and offers a fresh key package.
+        evil.recredential_at_epoch_inner(u64::from(u32::MAX)).unwrap();
+        let evil_kp = evil.key_package().unwrap();
+
+        // Can the honest device be made to admit it again?
+        let readmitted = honest.add_member_inner(&g, &evil_kp).is_ok();
+        assert!(
+            !readmitted,
+            "SECURITY: a revoked device re-certified itself at a higher epoch and was re-admitted. \
+             An epoch floor is a lower bound, so it cannot exclude a party that holds the account key \
+             and can mint at an arbitrary epoch. Exclusion needs IDENTITY (a signed revocation record \
+             checked at the gate), not ordering.",
+        );
+    }
+
+    #[test]
+    fn the_denylist_speaks_only_for_our_own_account_never_for_a_peers() {
+        // Scope check. Our account key signs records about OUR devices; it has no authority over a
+        // peer's, and a record naming a key we happen to also see on a peer leaf must not gate that
+        // leaf. Getting this wrong would let one account silently evict another's devices from a shared
+        // conversation, which is a worse failure than the hole this whole mechanism closes.
+        let (mut a, b, _, _) = authorized_pair();
+        let ga = sole_gid(&a);
+
+        // A revokes some key of its own, and (adversarially) the SAME bytes as B's live device key.
+        let b_sig = b.signature_public_key_hex();
+        a.revoke_device_inner(&b_sig, 1).unwrap();
+        assert!(a.is_revoked(&hex_to_bytes(&b_sig).unwrap()), "the record is held and verifies");
+
+        // B is still a member and still passes A's gate: the record is scoped to A's account key, and
+        // B's leaf carries B's.
+        let trusted = a.groups.get(&hex_to_bytes(&ga).unwrap()).unwrap().trusted_aaks.clone();
+        let identity = a
+            .groups
+            .get(&hex_to_bytes(&ga).unwrap())
+            .unwrap()
+            .group
+            .members()
+            .find(|m| hex(&m.signature_key) == b_sig)
+            .map(|m| BasicCredential::try_from(m.credential.clone()).unwrap().identity().to_vec())
+            .unwrap();
+        assert!(
+            a.check_added_leaf(&trusted, &hex_to_bytes(&b_sig).unwrap(), &identity).is_ok(),
+            "a peer's device must never be gated by OUR account's denylist",
+        );
+    }
+
+    #[test]
+    fn every_mirror_of_the_gate_refuses_a_revoked_device_not_just_check_added_leaf() {
+        // The gate is written in three places: check_added_leaf (the real one), the self-group BIRTH
+        // gate, and the key-package pre-filter. Drift between them has been a live bug class here
+        // before, and the self-group is the worst place to drift: it carries the whole contact graph,
+        // so admitting a revoked device there hands over the buddy list.
+        //
+        // The revoked device here is a SEED-HOLDER that has re-certified itself at u32::MAX, which is
+        // the whole point: at that epoch the floor check passes trivially, so if a mirror refuses the
+        // device it can only be because the denylist did it. A test where the floor could also catch it
+        // proves nothing about these sites (an earlier draft of this test had exactly that flaw).
+        let seed = [21u8; 32];
+        let mut evil = Conversation::new_authorized_inner("evil", &seed).unwrap();
+        let evil_sig = evil.signature_public_key_hex();
+        evil.recredential_at_epoch_inner(u64::from(u32::MAX)).unwrap();
+        let evil_kp = evil.key_package().unwrap();
+
+        // Before the record exists, both mirrors admit it: its cert verifies and sails over the floor.
+        let mut before = Conversation::new_authorized_inner("before", &seed).unwrap();
+        assert!(before.key_package_self_eligible_inner(&evil_kp), "eligible before the revoke");
+        assert!(before.create_self_group_inner(&[evil_kp.clone()]).is_ok(), "birth gate admits it before");
+
+        // Now the user revokes it, and the record reaches another device the way the control plane
+        // delivers one.
+        let record = crate::revoke::sign_revocation(
+            &authz::aak_from_seed(&seed).unwrap(),
+            &hex_to_bytes(&evil_sig).unwrap(),
+            1,
+        )
+        .unwrap();
+        let mut after = Conversation::new_authorized_inner("after", &seed).unwrap();
+        after.ingest_revocation_inner(&record).unwrap();
+
+        assert!(
+            !after.key_package_self_eligible_inner(&evil_kp),
+            "the pre-filter must refuse a revoked device even at an epoch far above the floor",
+        );
+        let err = after.create_self_group_inner(&[evil_kp]).unwrap_err();
+        assert!(err.contains("revoked"), "the self-group birth gate must refuse it, got: {err}");
+    }
+
+    #[test]
+    fn a_revoked_CERT_ONLY_device_cannot_recertify_at_all_bounding_the_attack() {
+        // Bounds the hole above. The re-certify attack needs the ACCOUNT KEY, which only a seed-holder
+        // has: a device paired by QR or six words adopts a CERTIFICATE and never learns the seed. So the
+        // blast radius is "devices provisioned with the recovery secret, plus the registering device",
+        // NOT every device. This test pins that boundary so a future change cannot widen it unnoticed.
+        let seed = [43u8; 32];
+        let holder = Conversation::new_authorized_inner("holder", &seed).unwrap();
+        let mut certonly = Conversation::new_inner("certonly").unwrap();
+        let aak_pub = holder.account_key_hex();
+        let target = certonly.signature_public_key_hex();
+
+        // Certify it the way pairing does: it receives a cert, never the seed.
+        let grant = holder
+            .authorize_scanned_device_inner(&hex_to_bytes(&target).unwrap(), 0)
+            .unwrap();
+        let cert = hex(&grant[40..104]);
+        certonly.adopt_certificate_inner(&aak_pub, 0, &cert).unwrap();
+        assert!(certonly.account_key_hex().is_empty(), "a paired device holds no account key");
+
+        // It cannot mint itself a new certificate at any epoch: no account key to sign with.
+        let err = certonly.recredential_at_epoch_inner(u64::from(u32::MAX)).unwrap_err();
+        assert!(
+            err.contains("no account key"),
+            "a cert-only device must not be able to re-certify itself, got: {err}",
+        );
+    }
+
+    #[test]
+    fn certifying_below_our_own_floor_raises_to_the_floor_instead_of_minting_a_dead_certificate() {
+        // The caller hard-coded epoch 0 for a long time. On an account that had ever revoked a device
+        // the floor is above 0, so every certificate minted was one our OWN gate refuses the moment the
+        // new device is staged into a group: pairing looked successful, the directory row was created,
+        // and the device could never be added — and the app's advice (revoke and pair again) raised the
+        // floor, making it permanent.
+        //
+        // The fix is to certify AT the floor, not to error. Erroring makes the disagreement the user's
+        // problem: the epoch is supplied by the control plane's counter and the floor is device-local,
+        // so any drift between them blocks pairing with nothing to be done about it. Raising is always
+        // safe (the epoch is a lower bound), and P7 moved exclusion onto the signed denylist, so a high
+        // epoch buys an attacker nothing.
+        let mut d1 = Conversation::new_authorized_inner("d1", &[10u8; 32]).unwrap();
+        d1.recredential_at_epoch_inner(7).unwrap(); // the account has advanced to epoch 7
+        let target = [9u8; 32];
+
+        // Asked for 0, signed at 7: the epoch is carried in the Grant at bytes 32..40, so the new device
+        // adopts the number we actually used.
+        let grant = d1.authorize_scanned_device_inner(&target, 0).unwrap();
+        let minted = u64::from_be_bytes(grant[32..40].try_into().unwrap());
+        assert_eq!(minted, 7, "a below-floor request must be raised to the floor, not signed as asked");
+        assert!(
+            verify_device_cert(&hex_to_bytes(&d1.account_key_hex()).unwrap(), 7, &target, &grant[40..104]),
+            "the certificate must actually verify at the epoch it claims",
+        );
+
+        // At or above the floor the requested epoch is honored unchanged.
+        for asked in [7u64, 8, 99] {
+            let g = d1.authorize_scanned_device_inner(&target, asked).unwrap();
+            assert_eq!(u64::from_be_bytes(g[32..40].try_into().unwrap()), asked);
+        }
+    }
+
+    #[test]
+    fn a_revoked_key_is_never_re_certified_by_either_pairing_path() {
+        // The mint side of the denylist. Once a device is revoked, our own gate denies its key, so
+        // handing it a fresh certificate would only produce a device that believes it is authorized and
+        // can never join anything. Both pairing paths must refuse, and must say why in a way that points
+        // at the actual remedy (pair as a NEW device, i.e. with a new key).
+        let mut d1 = Conversation::new_authorized_inner("d1", &[11u8; 32]).unwrap();
+        let target = [3u8; 32];
+        assert!(d1.authorize_scanned_device_inner(&target, 0).is_ok(), "not revoked yet");
+
+        d1.revoke_device_inner(&hex(&target), 1).unwrap();
+
+        let err = d1.authorize_scanned_device_inner(&target, 0).unwrap_err();
+        assert!(err.contains("revoked"), "got: {err}");
+        assert!(err.contains("new device"), "the message must name the remedy, got: {err}");
+
+        // And the six-word path, which reaches the same check before the SAS compare.
+        let nonce = [1u8; 16];
+        let sas = authz::sas_digest(&nonce, &hex_to_bytes(&d1.account_key_hex()).unwrap(), &target, 0);
+        let err = d1
+            .authorize_device_inner(&hex(&target), 0, &hex(&nonce), &hex(&sas))
+            .unwrap_err();
+        assert!(err.contains("revoked"), "got: {err}");
+
+        // A DIFFERENT key on the same (physical) device pairs normally: revocation names a key, so
+        // coming back means coming back as a new device, exactly as re-pairing already produces.
+        assert!(d1.authorize_scanned_device_inner(&[4u8; 32], 0).is_ok());
+    }
+
+    #[test]
+    fn revocation_records_survive_a_reload_and_a_forged_one_is_refused() {
+        // The denylist is only as good as its persistence: if a reload dropped it, the hole re-opened
+        // until the next successful fetch from a control plane that is free to stall forever.
+        let seed = [12u8; 32];
+        let mut d1 = Conversation::new_authorized_inner("d1", &seed).unwrap();
+        let target = [5u8; 32];
+        let record = d1.revoke_device_inner(&hex(&target), 1).unwrap();
+        assert_eq!(d1.revoked_device_keys().len(), 1);
+        assert!(d1.is_revoked(&target));
+
+        let msk = [7u8; 32];
+        let sealed = d1.export_sealed_inner(&msk).unwrap();
+        let reloaded = Conversation::from_sealed_inner(&msk, &sealed).unwrap();
+        assert!(reloaded.is_revoked(&target), "the denylist must survive a reload");
+        assert_eq!(reloaded.revoked_device_keys().len(), 1);
+        // Accepting records also derives the floor: |S| == 1, so nothing certifies below 1 any more.
+        assert_eq!(reloaded.effective_floor(&reloaded.our_account_pub().unwrap(), 0), 1);
+
+        // A record signed by SOMEONE ELSE's account key is refused outright, so a hostile control plane
+        // cannot revoke our devices by serving us fabricated records.
+        let mut d2 = Conversation::new_authorized_inner("d2", &[13u8; 32]).unwrap();
+        let foreign = d2.revoke_device_inner(&hex(&[6u8; 32]), 1).unwrap();
+        let mut victim = Conversation::new_authorized_inner("victim", &seed).unwrap();
+        assert!(victim.ingest_revocation_inner(&hex_to_bytes(&foreign).unwrap()).is_err());
+        assert!(!victim.is_revoked(&[6u8; 32]));
+
+        // The genuine record ingests once and is idempotent (the app re-fetches the whole set on every
+        // sync, so a second copy must not inflate the derived floor).
+        let blob = hex_to_bytes(&record).unwrap();
+        assert!(victim.ingest_revocation_inner(&blob).unwrap(), "new");
+        assert!(!victim.ingest_revocation_inner(&blob).unwrap(), "already held");
+        assert_eq!(victim.revoked_device_keys().len(), 1);
     }
 
     #[test]
@@ -3761,6 +4867,32 @@ mod tests {
         b.join_from_welcome_inner(&welcome2).unwrap();
         assert!(!a.is_self_conversation_inner(&hex(&mixed_gid)).unwrap(), "a group with a peer is not a self-group");
         assert!(!b.is_self_conversation_inner(&sole_gid(&b)).unwrap(), "the peer does not see it as ITS self-group either");
+
+        // The read-only diagnostic AGREES with the boolean and NAMES the cause. "self" exactly when the
+        // predicate is true; a concrete, non-sensitive reason exactly when it is false. This is what lets
+        // a stuck pairing be diagnosed by reading the reason instead of guessing at the roster.
+        assert_eq!(a.self_classification_reason(&hex(&self_gid)), "self");
+        assert_eq!(a2.self_classification_reason(&sole_gid(&a2)), "self");
+        let mixed_reason = a.self_classification_reason(&hex(&mixed_gid));
+        assert!(
+            mixed_reason.contains("different account") || mixed_reason.contains("foreign account"),
+            "a peer group must be named as such, got: {mixed_reason}",
+        );
+        // Reason and boolean can never disagree: whenever the reason is exactly "self", the predicate is
+        // true, and whenever it is anything else, the predicate is false. Assert the invariant directly.
+        for (conv, gid) in [(&a, hex(&self_gid)), (&a, hex(&mixed_gid))] {
+            let is_self = conv.is_self_conversation_inner(&gid).unwrap();
+            let reason_self = conv.self_classification_reason(&gid) == "self";
+            assert_eq!(is_self, reason_self, "reason and boolean must agree for {gid}");
+        }
+        // A device with no account anchor at all names that, rather than silently returning "not self".
+        let legacy = Conversation::new_inner("legacy").unwrap();
+        let solo = {
+            let mut l = legacy;
+            let g = l.create_self_inner().unwrap();
+            (l, hex(&g))
+        };
+        assert!(solo.0.self_classification_reason(&solo.1).contains("no account anchor"));
     }
 
     // BH-S3 refinement: our OWN echoed application frame is permanently undecryptable (the fan-out bus
@@ -3996,6 +5128,51 @@ mod tests {
         assert!(!s.channel_unlinked_inner(&hex(&mixed_self)).unwrap(), "a verified own sibling keeps it linked");
     }
 
+    // SG2 SELF-HEAL: a poisoned self-group (a frozen certless leaf, unrepairable in place) must be
+    // abandonable so the account can reform a clean one — WITHOUT opening a way to delete a healthy
+    // own-devices group. The refusals are the load-bearing half of this test.
+    #[test]
+    fn a_dead_self_group_can_be_abandoned_but_a_live_one_and_a_peer_conversation_never_are() {
+        let seed = [120u8; 32];
+
+        // A HEALTHY self-group (us + a certified sibling) must be REFUSED: it still works.
+        let mut s = Conversation::new_authorized_inner("s", &seed).unwrap();
+        let s2 = Conversation::new_authorized_inner("s2", &seed).unwrap();
+        let (_w, healthy) = s.create_self_group_inner(&[s2.key_package().unwrap()]).unwrap();
+        let err = s.abandon_dead_self_group_inner(&hex(&healthy), true).unwrap_err();
+        assert!(err.contains("still reachable"), "a live self-group must never be abandoned, got: {err}");
+        assert!(s.list_conversations_inner().contains(&hex(&healthy)), "and it is still held");
+
+        // A PEER conversation must be REFUSED even when unlinked: that is close_conversation's job, and
+        // this path must never become a way to silently drop someone else's chat.
+        let mut c = Conversation::new_authorized_inner("c", &[121u8; 32]).unwrap();
+        let orphan = Conversation::new_inner("orphan").unwrap();
+        let (_w2, peerish) = c.create_group_inner(&[orphan.key_package().unwrap()]).unwrap();
+        assert!(c.channel_unlinked_inner(&hex(&peerish)).unwrap(), "fixture really is unlinked");
+        // The caller has NOT recorded it as a self-group, which is the only signal that separates it from
+        // a poisoned self-group here. This is the case that protects a real pending peer chat.
+        let err2 = c.abandon_dead_self_group_inner(&hex(&peerish), false).unwrap_err();
+        assert!(err2.contains("not a recorded own-devices group"), "a peer conversation is refused, got: {err2}");
+        assert!(c.list_conversations_inner().contains(&hex(&peerish)), "and it survives");
+
+        // THE REAL CASE: a self-group whose only other member is a frozen CERTLESS leaf. It can never be
+        // repaired (MLS never rewrites a leaf credential) and never syncs — the live "ghost Note to Self".
+        // create_self_group_inner refuses to MINT one, so build the poisoned state the way it actually
+        // arises (an ungated create) and mark it own-account, exactly as the formation-time trusted set does.
+        let mut p = Conversation::new_authorized_inner("p", &seed).unwrap();
+        let certless = Conversation::new_inner("certless").unwrap();
+        let (_w3, dead) = p.create_group_inner(&[certless.key_package().unwrap()]).unwrap();
+        let our = p.our_account_pub().unwrap();
+        if let Some(slot) = p.groups.get_mut(&dead) {
+            slot.trusted_aaks = vec![(our, 0)]; // formed trusting ONLY our account: this is OUR group
+        }
+        assert!(p.channel_unlinked_inner(&hex(&dead)).unwrap(), "the poisoned group is unreachable");
+        assert!(p.abandon_dead_self_group_inner(&hex(&dead), true).unwrap(), "it is abandoned");
+        assert!(!p.list_conversations_inner().contains(&hex(&dead)), "and the MLS state is gone");
+        // Idempotent: abandoning again is a no-op, not an error (the heal may run on every reconnect).
+        assert!(!p.abandon_dead_self_group_inner(&hex(&dead), true).unwrap());
+    }
+
     // MIGRATION: a sealed blob written by an OLD build on a cert-only device carries the adopted
     // credential alongside EMPTY trusted sets. The restore must repopulate them, or the trusted
     // conjunct stays vacuous on the already-deployed population forever.
@@ -4156,6 +5333,89 @@ mod tests {
             }
             other => panic!("expected an application message, got {other:?}"),
         }
+    }
+
+    // THE SELF-GROUP SPLIT REGRESSION (2026-08-01). A KeyPackage's private half lives only in the
+    // provider's storage map until a reseal writes it down, and the sealed blob IS that map. Minting
+    // AFTER the last seal therefore publishes a public package whose private half dies on the next
+    // reload — the directory still advertises it, a sibling claims it, and the Welcome sealed to it is
+    // mathematically un-openable. These two tests pin both directions of the ordering contract that
+    // the client's `freshKeyPackages` now enforces (mint, then seal, THEN publish).
+    #[test]
+    fn a_key_package_sealed_after_minting_survives_a_reload() {
+        let msk = [7u8; 32];
+        let mut d1 = Conversation::new_authorized_inner("d1", &[76u8; 32]).unwrap();
+        let mut d2 = Conversation::new_inner("d2").unwrap();
+        transfer_authorize(&d1, &mut d2, 0).unwrap();
+
+        let kp = d2.key_package().unwrap(); // published to the directory
+        let sealed = d2.export_sealed_inner(&msk).unwrap(); // Fix A: seal AFTER minting
+        let mut d2 = Conversation::from_sealed_inner(&msk, &sealed).unwrap(); // reload (iOS tab recycle)
+
+        let (welcome, _gid) = d1.create_group_inner(&[kp]).unwrap();
+        assert!(
+            d2.join_from_welcome_inner(&welcome).is_ok(),
+            "a key package sealed after minting must still open its Welcome after a reload"
+        );
+    }
+
+    #[test]
+    fn a_key_package_minted_after_the_last_seal_is_lost_on_reload() {
+        let msk = [8u8; 32];
+        let mut d1 = Conversation::new_authorized_inner("d1", &[77u8; 32]).unwrap();
+        let mut d2 = Conversation::new_inner("d2").unwrap();
+        transfer_authorize(&d1, &mut d2, 0).unwrap();
+
+        let sealed = d2.export_sealed_inner(&msk).unwrap(); // the OLD order: seal, then mint
+        let kp = d2.key_package().unwrap(); // private half never reaches the blob
+        let mut d2 = Conversation::from_sealed_inner(&msk, &sealed).unwrap();
+
+        let (welcome, _gid) = d1.create_group_inner(&[kp]).unwrap();
+        let err = d2.join_from_welcome_inner(&welcome).unwrap_err();
+        assert!(
+            err.contains("NoMatchingKeyPackage"),
+            "an orphaned key package must fail loudly as NoMatchingKeyPackage, got: {err}"
+        );
+    }
+
+    // The directory keeps ONE permanently re-claimable last-resort row (UserStore: no consumed_at
+    // filter), so its private bundle must survive a join. OpenMLS only skips the delete when the
+    // LastResort extension is present — without it the SECOND claim of that same row yields an
+    // un-openable Welcome, with no crash and no race required.
+    #[test]
+    fn the_last_resort_key_package_is_reusable_across_joins() {
+        let mut d1 = Conversation::new_authorized_inner("d1", &[78u8; 32]).unwrap();
+        let mut d2 = Conversation::new_inner("d2").unwrap();
+        transfer_authorize(&d1, &mut d2, 0).unwrap();
+
+        let lr = d2.key_package_last_resort().unwrap();
+        let (w1, _) = d1.create_group_inner(&[lr.clone()]).unwrap();
+        d2.join_from_welcome_inner(&w1).expect("first join with the last-resort package");
+
+        let (w2, _) = d1.create_group_inner(&[lr]).unwrap();
+        assert!(
+            d2.join_from_welcome_inner(&w2).is_ok(),
+            "the last-resort package is re-served forever, so its bundle must survive the first join"
+        );
+    }
+
+    // The counterpart boundary: ONE-TIME packages must still be consumed by their first join, or a
+    // stale directory row would let a package be claimed twice and silently fork forward secrecy.
+    #[test]
+    fn a_one_time_key_package_is_consumed_by_its_first_join() {
+        let mut d1 = Conversation::new_authorized_inner("d1", &[79u8; 32]).unwrap();
+        let mut d2 = Conversation::new_inner("d2").unwrap();
+        transfer_authorize(&d1, &mut d2, 0).unwrap();
+
+        let kp = d2.key_package().unwrap();
+        let (w1, _) = d1.create_group_inner(&[kp.clone()]).unwrap();
+        d2.join_from_welcome_inner(&w1).expect("first join with a one-time package");
+
+        let (w2, _) = d1.create_group_inner(&[kp]).unwrap();
+        assert!(
+            d2.join_from_welcome_inner(&w2).is_err(),
+            "a one-time key package must not open a second Welcome"
+        );
     }
 
     // The cert-only fallback must NOT weaken the peer boundary: a group holding a PEER is still not a

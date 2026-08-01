@@ -13,27 +13,69 @@ use PHPUnit\Framework\TestCase;
 final class AccountTest extends TestCase
 {
     private Api $api;
+    private PDO $pdo; // the database behind $this->api, for asserting on rows the API does not expose
     private string $u;
     private string $a;
     private string $k; // the first device key
 
     protected function setUp(): void
     {
-        $this->api = new Api(new UserStore((new Db(':memory:'))->pdo(), 1_000_000));
+        $this->pdo = (new Db(':memory:'))->pdo();
+        $this->api = new Api(new UserStore($this->pdo, 1_000_000, 8)); // real proof of work, low difficulty
         $this->u = str_repeat('a', 64);
         $this->a = str_repeat('b', 64);
         $this->k = str_repeat('c', 64);
     }
 
+    /** COUNT(*) for a parameterized query against the API's own database. */
+    private function countRows(string $sql, string ...$params): int
+    {
+        $stmt = $this->pdo->prepare($sql);
+        $stmt->execute($params);
+        return (int) $stmt->fetchColumn();
+    }
+
     /** @param array<array-key, mixed> $body */
     private function register(array $body): int
     {
-        return $this->api->register($body)[0];
+        // Every registration carries its own freshly solved proof: challenges are single-use, so reusing
+        // one here would (correctly) be refused as a replay.
+        return $this->api->register([...$body, 'pow' => $this->pow()])[0];
+    }
+
+    /** Solve a registration challenge the way the client does: grind a nonce until the digest has the
+     *  required leading zero bits. The suite runs at a low difficulty so this is milliseconds, but it is
+     *  the SAME code path a real registration takes, MAC and replay guard included. */
+    /** @return array{challenge: string, expiresAt: mixed, mac: mixed, nonce: string} */
+    private function pow(): array
+    {
+        $c = $this->api->challenge();
+        self::assertSame(200, $c[0]);
+        $challenge = $c[1]['challenge'];
+        self::assertIsString($challenge);
+        $bits = $c[1]['bits'];
+        self::assertIsInt($bits);
+        for ($n = 0; ; $n++) {
+            $digest = hash('sha256', $challenge . "\x1f" . $n);
+            $lead = 0;
+            foreach (str_split($digest) as $ch) {
+                $v = (int) hexdec($ch);
+                if ($v === 0) {
+                    $lead += 4;
+                    continue;
+                }
+                $lead += $v >= 8 ? 0 : ($v >= 4 ? 1 : ($v >= 2 ? 2 : 3));
+                break;
+            }
+            if ($lead >= $bits) {
+                return ['challenge' => $challenge, 'expiresAt' => $c[1]['expiresAt'], 'mac' => $c[1]['mac'], 'nonce' => (string) $n];
+            }
+        }
     }
 
     private function registerToken(): string
     {
-        $res = $this->api->register(['usernameHash' => $this->u, 'authSecret' => $this->a, 'identityKey' => $this->k]);
+        $res = $this->api->register(['usernameHash' => $this->u, 'authSecret' => $this->a, 'identityKey' => $this->k, 'pow' => $this->pow()]);
         self::assertSame(201, $res[0]);
         self::assertIsString($res[1]['token']);
         return $res[1]['token'];
@@ -71,7 +113,7 @@ final class AccountTest extends TestCase
     {
         $u2 = str_repeat('e', 64);
         $a2 = str_repeat('f', 64);
-        $this->api->register(['usernameHash' => $u2, 'authSecret' => $a2, 'identityKey' => str_repeat('7', 64)]);
+        $this->api->register(['usernameHash' => $u2, 'authSecret' => $a2, 'identityKey' => str_repeat('7', 64), 'pow' => $this->pow()]);
         $t = $this->api->login(['usernameHash' => $u2, 'authSecret' => $a2])[1]['token'];
         self::assertIsString($t);
         return $t;
@@ -113,6 +155,29 @@ final class AccountTest extends TestCase
         self::assertSame(401, $this->api->login(['usernameHash' => str_repeat('f', 64), 'authSecret' => $this->a])[0]);
     }
 
+    public function testLoginUpgradesAHashStoredUnderWeakerParametersAndKeepsAuthenticating(): void
+    {
+        $this->registerToken();
+        // A row written by an older deployment at a lower cost. It must keep verifying (password_verify
+        // reads the parameters out of the hash) and must be rewritten at the pinned cost on first use,
+        // so the stored corpus converges on one parameter set - which is what keeps the real and dummy
+        // login paths at identical cost, and therefore keeps login from timing out account existence.
+        $weak = password_hash($this->a, PASSWORD_ARGON2ID, ['memory_cost' => 8192, 'time_cost' => 1, 'threads' => 1]);
+        $this->pdo->prepare('UPDATE users SET auth_hash = ? WHERE username_hash = ?')->execute([$weak, $this->u]);
+
+        self::assertSame(200, $this->api->login(['usernameHash' => $this->u, 'authSecret' => $this->a])[0]);
+
+        $stmt = $this->pdo->prepare('SELECT auth_hash FROM users WHERE username_hash = ?');
+        $stmt->execute([$this->u]);
+        $stored = $stmt->fetchColumn();
+        self::assertIsString($stored);
+        self::assertNotSame($weak, $stored, 'the weak hash was rehashed on successful login');
+        self::assertStringContainsString('m=65536,t=4,p=1', $stored, 'rehashed at the pinned parameters');
+        // The upgraded row still accepts the right secret and still rejects a wrong one.
+        self::assertSame(200, $this->api->login(['usernameHash' => $this->u, 'authSecret' => $this->a])[0]);
+        self::assertSame(401, $this->api->login(['usernameHash' => $this->u, 'authSecret' => str_repeat('d', 64)])[0]);
+    }
+
     public function testLookupReturnsTheActiveDeviceKeyForAuthenticatedSessions(): void
     {
         $token = $this->registerToken();
@@ -122,7 +187,144 @@ final class AccountTest extends TestCase
         self::assertSame([$this->k], $ok[1]['deviceKeys']);
 
         self::assertSame(401, $this->api->lookup(['usernameHash' => $this->u])[0]); // no token
-        self::assertSame(404, $this->api->lookup(['token' => $token, 'usernameHash' => str_repeat('f', 64)])[0]); // unknown user
+    }
+
+    public function testLookupAnswersUnknownAndDevicelessAccountsWithTheSameEmptyShape(): void
+    {
+        // The old 404-vs-200 split made this the cheapest existence oracle in the system. Now every
+        // miss is one 200 with an empty device list, whatever the reason for the miss.
+        $token = $this->registerToken();
+        $miss = [200, ['activeDeviceKey' => null, 'deviceKeys' => []]];
+
+        // (a) no such account.
+        self::assertSame($miss, $this->api->lookup(['token' => $token, 'usernameHash' => str_repeat('f', 64)]));
+
+        // (b) the account exists but every device of it is revoked: byte-identical to (a).
+        $deviceId = self::currentOf($this->devicesOf($token))['deviceId'];
+        self::assertIsString($deviceId);
+        self::assertSame(200, $this->api->revokeDevice(['token' => $token, 'deviceId' => $deviceId])[0]);
+        $other = $this->otherToken();
+        self::assertSame($miss, $this->api->lookup(['token' => $other, 'usernameHash' => $this->u]));
+
+        // A malformed hash is still a 400: that is about the caller's own request, not about a target.
+        self::assertSame(400, $this->api->lookup(['token' => $other, 'usernameHash' => 'nothex'])[0]);
+    }
+
+    public function testProbeThrottleAllowsALegitimateRateThenDeniesAndRollsWithTheWindow(): void
+    {
+        $pdo = (new Db(':memory:'))->pdo();
+        $store = new UserStore($pdo, 1_000_000); // window start: 1_000_000 % 60 == 40, so the window is [999_960, 1_000_020)
+        $caller = $this->u;
+
+        // Read the ceiling from the constant rather than hardcoding it: an earlier cut sized this at 120,
+        // which was BELOW what the client's own 30-second presence poll spends, so real users' buddies
+        // silently read offline. A test that pins the number would have shipped that quietly again.
+        $cap = (new \ReflectionClass(UserStore::class))->getConstant('PROBE_MAX_PER_WINDOW');
+        self::assertIsInt($cap);
+        for ($i = 0; $i < $cap; $i++) {
+            self::assertTrue($store->allowProbe($caller), "probe $i is within the budget");
+        }
+        self::assertFalse($store->allowProbe($caller), 'the probe past the ceiling is denied');
+        self::assertFalse($store->allowProbe($caller), 'and it stays denied for the rest of the window');
+
+        // The budget is per caller, so a different account is unaffected.
+        self::assertTrue($store->allowProbe(str_repeat('9', 64)));
+
+        // The next window gives the caller a fresh budget.
+        self::assertTrue((new UserStore($pdo, 1_000_060))->allowProbe($caller));
+    }
+
+    public function testProbeThrottleFailsClosedWhenTheCounterCannotBeRead(): void
+    {
+        // A database fault that silently disabled the limiter is exactly the window a harvester wants,
+        // so an unreadable counter must DENY. Dropping the table is the bluntest way to make the read
+        // fail; a locked or corrupt database is the realistic one.
+        $pdo = (new Db(':memory:'))->pdo();
+        $store = new UserStore($pdo, 1_000_000);
+        self::assertTrue($store->allowProbe($this->u));
+        $pdo->exec('DROP TABLE probe_rate');
+        self::assertFalse($store->allowProbe($this->u), 'no counter, no probe');
+    }
+
+    public function testProbeBudgetIsSharedAcrossTheDirectoryEndpointsAndDenialLooksLikeAMiss(): void
+    {
+        // One shared budget: an attacker must not get a full budget of lookups AND another of presence
+        // polls AND another of away reads. Spend it all on lookup, then check the other three endpoints
+        // answer exactly as they would for an account that does not exist.
+        $token = $this->registerToken();
+        $this->api->publishKeys(['token' => $token, 'keyPackages' => [
+            ['keyPackage' => str_repeat('cc', 100), 'ref' => str_repeat('9', 64), 'lastResort' => true],
+        ]]);
+        self::assertSame(200, $this->api->setPresence(['token' => $token, 'status' => 'online'])[0]);
+
+        $other = $this->otherToken();
+        $unknown = str_repeat('f', 64);
+        // What a miss looks like for each endpoint, captured while the caller still has budget.
+        $lookupMiss = $this->api->lookup(['token' => $other, 'usernameHash' => $unknown]);
+        $awayMiss = $this->api->awayLookup(['token' => $other, 'usernameHash' => $unknown]);
+        $presenceMiss = $this->api->getPresence(['token' => $other, 'usernameHash' => $unknown]);
+        $takeMiss = $this->api->takeKeys(['token' => $other, 'usernameHash' => $unknown]);
+
+        // Burn the rest of the shared budget (4 probes are already spent above). Sized off the constant
+        // so raising the ceiling cannot silently stop this test from reaching it.
+        $cap = (new \ReflectionClass(UserStore::class))->getConstant('PROBE_MAX_PER_WINDOW');
+        self::assertIsInt($cap);
+        for ($i = 0; $i < $cap - 4; $i++) {
+            $this->api->lookup(['token' => $other, 'usernameHash' => $unknown]);
+        }
+
+        // The target is real, live and has key packages - and every endpoint now answers as a miss.
+        self::assertSame($lookupMiss, $this->api->lookup(['token' => $other, 'usernameHash' => $this->u]));
+        self::assertSame($awayMiss, $this->api->awayLookup(['token' => $other, 'usernameHash' => $this->u]));
+        self::assertSame($presenceMiss, $this->api->getPresence(['token' => $other, 'usernameHash' => $this->u]));
+        self::assertSame($takeMiss, $this->api->takeKeys(['token' => $other, 'usernameHash' => $this->u]));
+        // Specifically: no 429, no distinct error body, nothing that says "you were throttled".
+        self::assertSame(200, $this->api->lookup(['token' => $other, 'usernameHash' => $this->u])[0]);
+        self::assertSame('offline', $this->api->getPresence(['token' => $other, 'usernameHash' => $this->u])[1]['status']);
+
+        // The throttled caller's own account is untouched: self-scoped writes are not directory probes.
+        self::assertSame(200, $this->api->setPresence(['token' => $other, 'status' => 'online'])[0]);
+        // A different caller reads the truth, proving the throttle is per caller and not a server-wide
+        // outage (and that the target really was live all along).
+        $fresh = $this->api->lookup(['token' => $token, 'usernameHash' => $this->u]);
+        self::assertSame($this->k, $fresh[1]['activeDeviceKey']);
+    }
+
+    public function testDeleteAccountAlsoErasesTheRateCounterRows(): void
+    {
+        // take_rate rows pair a caller with a target: a contact-graph fragment the server is not
+        // supposed to hold (P2). Self destruct must not leave them behind.
+        $token = $this->registerToken();
+        $other = $this->otherToken();
+        $u2 = str_repeat('e', 64); // the account behind otherToken()
+        // One row each way: (u2 -> u) and (u -> u2).
+        self::assertSame(200, $this->api->takeKeys(['token' => $other, 'usernameHash' => $this->u])[0]);
+        self::assertSame(200, $this->api->takeKeys(['token' => $token, 'usernameHash' => $u2])[0]);
+        self::assertSame(2, $this->countRows('SELECT COUNT(*) FROM take_rate'));
+        self::assertSame(1, $this->countRows('SELECT COUNT(*) FROM probe_rate WHERE caller = ?', $u2));
+
+        self::assertSame(200, $this->api->deleteAccount(['token' => $other])[0]);
+        self::assertSame(0, $this->countRows('SELECT COUNT(*) FROM probe_rate WHERE caller = ?', $u2));
+        // Both rows are gone: the one where the deleted account was the CALLER and the one where it was
+        // the TARGET. Either alone would still say this account and that account had contact.
+        self::assertSame(0, $this->countRows('SELECT COUNT(*) FROM take_rate'));
+    }
+
+    public function testStaleRateRowsArePrunedWhenACallerRollsIntoANewWindow(): void
+    {
+        // The (caller, target) residue in take_rate must not accumulate forever.
+        $pdo = (new Db(':memory:'))->pdo();
+        (new UserStore($pdo, 1_000_000))->allowTake($this->u, str_repeat('7', 64));
+        $count = static function () use ($pdo): int {
+            $stmt = $pdo->prepare('SELECT COUNT(*) FROM take_rate');
+            $stmt->execute();
+            return (int) $stmt->fetchColumn();
+        };
+        self::assertSame(1, $count());
+
+        // A probe three windows later prunes it (and any probe row older than the previous window).
+        self::assertTrue((new UserStore($pdo, 1_000_180))->allowProbe($this->u));
+        self::assertSame(0, $count());
     }
 
     public function testAddDeviceIsTwoFactorAndIdempotent(): void
@@ -152,7 +354,7 @@ final class AccountTest extends TestCase
         // account 2 registers, then tries to enroll account 1's device key.
         $u2 = str_repeat('e', 64);
         $a2 = str_repeat('f', 64);
-        $this->api->register(['usernameHash' => $u2, 'authSecret' => $a2, 'identityKey' => str_repeat('7', 64)]);
+        $this->api->register(['usernameHash' => $u2, 'authSecret' => $a2, 'identityKey' => str_repeat('7', 64), 'pow' => $this->pow()]);
         $token2 = $this->api->login(['usernameHash' => $u2, 'authSecret' => $a2])[1]['token'];
         self::assertIsString($token2);
         $taken = $this->api->addDevice(['token' => $token2, 'authSecret' => $a2, 'deviceKey' => $this->k]);
@@ -170,6 +372,38 @@ final class AccountTest extends TestCase
         // Each session sees exactly one current device, and it is its own.
         self::assertSame($this->k, self::currentOf($this->devicesOf($token1))['deviceKey']);
         self::assertSame($k2, self::currentOf($this->devicesOf($token2))['deviceKey']);
+    }
+
+    public function testAccountEpochIsAnExplicitMonotonicCounterNotACountOfTombstones(): void
+    {
+        // The whole point of the counter. The epoch used to BE the number of revoked device rows, so
+        // pruning old tombstones walked it backward while each device's local floor stayed put, and the
+        // next paired device was certified below the floor and could never join. The counter is now
+        // authoritative: revoking raises it, and deleting history does not lower it.
+        $token1 = $this->registerToken();
+        self::assertSame(0, $this->api->listDevices(['token' => $token1])[1]['accountEpoch']);
+
+        $k2 = str_repeat('2', 64);
+        $token2 = $this->loginToken();
+        $deviceId2 = $this->api->addDevice(['token' => $token2, 'authSecret' => $this->a, 'deviceKey' => $k2])[1]['deviceId'];
+        self::assertIsString($deviceId2);
+        // Enrolling a device does NOT move the epoch; only revocation does.
+        self::assertSame(0, $this->api->listDevices(['token' => $token1])[1]['accountEpoch']);
+
+        self::assertSame(200, $this->api->revokeDevice(['token' => $token1, 'deviceId' => $deviceId2])[0]);
+        self::assertSame(1, $this->api->listDevices(['token' => $token1])[1]['accountEpoch']);
+
+        // Re-revoking the SAME device is idempotent and must not inflate the floor.
+        $this->api->revokeDevice(['token' => $token1, 'deviceId' => $deviceId2]);
+        self::assertSame(1, $this->api->listDevices(['token' => $token1])[1]['accountEpoch']);
+
+        // Prune the tombstone, exactly as an operator cleaning up device history would.
+        $this->pdo->prepare('DELETE FROM devices WHERE device_id = ?')->execute([$deviceId2]);
+        self::assertSame(
+            1,
+            $this->api->listDevices(['token' => $token1])[1]['accountEpoch'],
+            'deleting revoked history must NEVER lower the authorization floor',
+        );
     }
 
     public function testRevokeBurnsTheDeviceCutsItsSessionAndFallsBackTheDirectory(): void
@@ -406,8 +640,31 @@ final class AccountTest extends TestCase
     public function testLoginReapsAgedOrphansViaTheApi(): void
     {
         $pdo = (new Db(':memory:'))->pdo();
-        $early = new Api(new UserStore($pdo, 1000));
-        $reg = $early->register(['usernameHash' => $this->u, 'authSecret' => $this->a, 'identityKey' => $this->k]);
+        $earlyStore = new UserStore($pdo, 1000, 8);
+        $early = new Api($earlyStore);
+        $ch = $early->challenge()[1];
+        $powNonce = 0;
+        while (true) {
+            $chal = $ch['challenge'];
+            self::assertIsString($chal);
+            $d = hash('sha256', $chal . "\x1f" . $powNonce);
+            $lead = 0;
+            foreach (str_split($d) as $c2) {
+                $v = (int) hexdec($c2);
+                if ($v === 0) {
+                    $lead += 4;
+                    continue;
+                }
+                $lead += $v >= 8 ? 0 : ($v >= 4 ? 1 : ($v >= 2 ? 2 : 3));
+                break;
+            }
+            if ($lead >= 8) {
+                break;
+            }
+            $powNonce++;
+        }
+        $reg = $early->register(['usernameHash' => $this->u, 'authSecret' => $this->a, 'identityKey' => $this->k,
+            'pow' => ['challenge' => $ch['challenge'], 'expiresAt' => $ch['expiresAt'], 'mac' => $ch['mac'], 'nonce' => (string) $powNonce]]);
         $early->publishKeys(['token' => $reg[1]['token'], 'keyPackages' => [
             ['keyPackage' => str_repeat('aa', 100), 'ref' => str_repeat('1', 64), 'lastResort' => false],
         ]]); // device 1 authorized
@@ -462,12 +719,137 @@ final class AccountTest extends TestCase
             ['keyPackage' => str_repeat('cc', 100), 'ref' => str_repeat('9', 64), 'lastResort' => true],
         ]]);
         $other = $this->otherToken();
-        // A single caller may claim against one target up to the per-window ceiling (30); the very next
-        // claim in the same window is rate-limited, bounding a prekey-exhaustion drain loop.
+        // A single caller may claim against one target up to the per-window ceiling (30), bounding a
+        // prekey-exhaustion drain loop. The very next claim is refused AS A MISS, not with a 429: an
+        // explicit rate-limit status here would have told the caller that the separate per-caller probe
+        // budget was still available, which is a statistics-free read of throttle state from the one
+        // endpoint that must not give one.
         for ($i = 0; $i < 30; $i++) {
             self::assertSame(200, $this->api->takeKeys(['token' => $other, 'usernameHash' => $this->u])[0]);
         }
-        self::assertSame(429, $this->api->takeKeys(['token' => $other, 'usernameHash' => $this->u])[0]);
+        $refused = $this->api->takeKeys(['token' => $other, 'usernameHash' => $this->u]);
+        self::assertSame(200, $refused[0]);
+        self::assertSame(['devices' => []], $refused[1]);
+        // And it is byte-identical to asking for an account that does not exist.
+        $missing = $this->api->takeKeys(['token' => $other, 'usernameHash' => str_repeat('7', 64)]);
+        self::assertSame($missing, $refused);
+    }
+
+    public function testAV2LoginCostsNoServerArgon2AndMigratesOnFirstV1SignIn(): void
+    {
+        $v2 = str_repeat('5', 64);
+        // An account created BEFORE the migration: v1 only, so the server holds an Argon2id hash.
+        $this->registerToken();
+        $q1 = $this->pdo->prepare('SELECT auth_v2 FROM users WHERE username_hash = ?');
+        $q1->execute([$this->u]);
+        $row = $q1->fetch();
+        self::assertNull(is_array($row) ? $row['auth_v2'] : 'missing', 'a legacy account starts with no v2 verifier');
+
+        // Its first sign-in supplying a v2 secret verifies via v1 and UPGRADES the row.
+        self::assertSame(200, $this->api->login(['usernameHash' => $this->u, 'authSecret' => $this->a, 'authSecretV2' => $v2])[0]);
+        $q2 = $this->pdo->prepare('SELECT auth_v2 FROM users WHERE username_hash = ?');
+        $q2->execute([$this->u]);
+        $after = $q2->fetch();
+        self::assertIsString(is_array($after) ? $after['auth_v2'] : null, 'the account migrated to the fast verifier');
+
+        // From here the v2 secret takes the fast path.
+        self::assertSame(200, $this->api->login(['usernameHash' => $this->u, 'authSecret' => $this->a, 'authSecretV2' => $v2])[0]);
+        // A wrong v2 beside a CORRECT v1 still authenticates, by design: the caller proved knowledge of
+        // the passphrase, and a stale or broken client KDF must not lock them out.
+        self::assertSame(200, $this->api->login(['usernameHash' => $this->u, 'authSecret' => $this->a, 'authSecretV2' => str_repeat('6', 64)])[0]);
+        // ...and that must NOT have replaced the stored verifier with the wrong one. If it had, the
+        // wrong v2 would then authenticate on the fast path with no passphrase knowledge at all.
+        self::assertSame(401, $this->api->login(['usernameHash' => $this->u, 'authSecret' => str_repeat('7', 64), 'authSecretV2' => str_repeat('6', 64)])[0]);
+        // The original correct v2 still works, proving the verifier survived intact.
+        self::assertSame(200, $this->api->login(['usernameHash' => $this->u, 'authSecret' => str_repeat('7', 64), 'authSecretV2' => $v2])[0]);
+        // The v1 secret STILL works on its own after migration, and that is deliberate. /api/add-device
+        // authenticates with the v1 secret, and a client whose wasm fails to load has only v1; making the
+        // fast verifier exclusive locked every account out of both. v2 is a fast path, not a gate.
+        self::assertSame(200, $this->api->login(['usernameHash' => $this->u, 'authSecret' => $this->a])[0]);
+        // A wrong v1 secret is still refused, so the fallback is a fallback and not a bypass.
+        self::assertSame(401, $this->api->login(['usernameHash' => $this->u, 'authSecret' => str_repeat('7', 64)])[0]);
+    }
+
+    public function testAddDeviceStillWorksAfterAnAccountMigratesToTheFastVerifier(): void
+    {
+        // The regression that would have bricked every account: add-device authenticates with the v1
+        // secret alone, and the app refuses a sign-in whose device enrollment fails, so an exclusive v2
+        // verifier turned "migrated" into "permanently locked out" on the very next login.
+        $v2 = str_repeat('5', 64);
+        $token = $this->registerToken();
+        self::assertSame(200, $this->api->login(['usernameHash' => $this->u, 'authSecret' => $this->a, 'authSecretV2' => $v2])[0]);
+        $res = $this->api->addDevice(['token' => $token, 'authSecret' => $this->a, 'deviceKey' => str_repeat('8', 64)]);
+        self::assertContains($res[0], [200, 201], 'a migrated account must still be able to enroll a device');
+    }
+
+    public function testProofOfWorkIsRequiredAndCannotBeReplayedOrForged(): void
+    {
+        $body = ['usernameHash' => str_repeat('1', 64), 'authSecret' => str_repeat('2', 64), 'identityKey' => str_repeat('3', 64)];
+        // No proof at all.
+        self::assertSame(400, $this->api->register($body)[0]);
+        // A forged MAC over a challenge the server never issued.
+        self::assertSame(400, $this->api->register([...$body, 'pow' => [
+            'challenge' => str_repeat('a', 32), 'expiresAt' => 1_000_300, 'mac' => str_repeat('b', 64), 'nonce' => '1',
+        ]])[0]);
+        // A real challenge with a WRONG solution.
+        $good = $this->pow();
+        self::assertSame(400, $this->api->register([...$body, 'pow' => [...$good, 'nonce' => 'not-the-solution']])[0]);
+        // The correct solution works exactly once; the SAME proof is refused the second time.
+        self::assertSame(201, $this->api->register([...$body, 'pow' => $good])[0]);
+        self::assertSame(400, $this->api->register([
+            'usernameHash' => str_repeat('4', 64), 'authSecret' => str_repeat('2', 64), 'identityKey' => str_repeat('5', 64),
+            'pow' => $good,
+        ])[0], 'a spent challenge cannot be replayed into a second account');
+    }
+
+    public function testNobodyCanLockAnOwnerOutOfTheirAccountByGuessing(): void
+    {
+        // Two cuts of a per-account attempt limiter both turned into a weapon: anyone who knew a handle
+        // could spend its budget with garbage and refuse the OWNER's correct passphrase, which also
+        // locked them out of their own on-device vault. An earlier version of this very test asserted
+        // that lockout while its name denied it, which is how the suite stayed green over the bug.
+        //
+        // Both an UNMIGRATED account (what every live account is today) and a migrated one must survive
+        // a sustained wrong-guess flood.
+        $v2 = str_repeat('5', 64);
+        $this->registerToken(); // registered WITHOUT v2: unmigrated, the live-account state
+        $wrong = str_repeat('0', 64);
+        for ($i = 0; $i < 40; $i++) {
+            self::assertSame(401, $this->api->login(['usernameHash' => $this->u, 'authSecret' => $wrong])[0]);
+        }
+        self::assertSame(200, $this->api->login(['usernameHash' => $this->u, 'authSecret' => $this->a])[0],
+            'an UNMIGRATED owner must still get in after a flood of wrong guesses');
+
+        // Migrate, then flood again: still in, on either secret.
+        self::assertSame(200, $this->api->login(['usernameHash' => $this->u, 'authSecret' => $this->a, 'authSecretV2' => $v2])[0]);
+        for ($i = 0; $i < 40; $i++) {
+            self::assertSame(401, $this->api->login(['usernameHash' => $this->u, 'authSecret' => $wrong, 'authSecretV2' => $wrong])[0]);
+        }
+        self::assertSame(200, $this->api->login(['usernameHash' => $this->u, 'authSecret' => $this->a, 'authSecretV2' => $v2])[0]);
+        self::assertSame(200, $this->api->login(['usernameHash' => $this->u, 'authSecret' => $this->a])[0]);
+    }
+
+    public function testAMissAndAWrongCredentialHitAreIndistinguishable(): void
+    {
+        // The existence oracle: an attacker never holds a matching v2 secret, so every real account fell
+        // through to Argon2id (~150ms) while every absent one answered in ~1ms. A sweep separated them
+        // with non-overlapping distributions. Both paths must run exactly ONE Argon2id.
+        $this->registerToken();
+        $wrong = str_repeat('0', 64);
+        $t0 = microtime(true);
+        $hit = $this->api->login(['usernameHash' => $this->u, 'authSecret' => $wrong]);
+        $hitMs = (microtime(true) - $t0) * 1000;
+        $t1 = microtime(true);
+        $miss = $this->api->login(['usernameHash' => str_repeat('e', 64), 'authSecret' => $wrong]);
+        $missMs = (microtime(true) - $t1) * 1000;
+
+        self::assertSame($hit, $miss, 'the responses must be byte-identical');
+        // Both pay a real Argon2id, so neither is in the "instant" range that gave the sweep its signal.
+        self::assertGreaterThan(20, $hitMs, 'a wrong-credential hit must pay Argon2id');
+        self::assertGreaterThan(20, $missMs, 'a miss must pay Argon2id too, or it is an existence oracle');
+        // And they must be within the same order of magnitude of each other.
+        $ratio = max($hitMs, $missMs) / max(0.001, min($hitMs, $missMs));
+        self::assertLessThan(3.0, $ratio, "miss/hit timing ratio {$ratio} is a usable existence signal");
     }
 
     public function testRevokeDeletesTheDevicesKeyPackages(): void
@@ -590,5 +972,84 @@ final class AccountTest extends TestCase
         self::assertFalse($cleared[1]['away']);
         // After clearing there is no row, so a lookup returns null even when offline.
         self::assertNull($this->api->awayLookup(['token' => $other, 'usernameHash' => $this->u])[1]['away']);
+    }
+
+    public function testRevocationRecordsAreStoredVerbatimAndServedBackToTheAccount(): void
+    {
+        // ADR-022 P7. The server is a dead drop for these blobs: it holds no account key, so it can
+        // neither produce one nor judge one beyond its shape, and the client re-verifies every signature.
+        $token = $this->registerToken();
+        self::assertSame([], $this->api->listRevocations(['token' => $token])[1]['revocations']);
+
+        $k2 = str_repeat('2', 64);
+        $token2 = $this->loginToken();
+        $deviceId2 = $this->api->addDevice(['token' => $token2, 'authSecret' => $this->a, 'deviceKey' => $k2])[1]['deviceId'];
+        self::assertIsString($deviceId2);
+
+        $record = str_repeat('ab', 140); // one 140-byte record as hex
+        $res = $this->api->revokeDevice(['token' => $token, 'deviceId' => $deviceId2, 'record' => $record]);
+        self::assertSame(200, $res[0]);
+        self::assertTrue($res[1]['recordStored'], 'the client must be told the durable half landed');
+        self::assertSame([$record], $this->api->listRevocations(['token' => $token])[1]['revocations']);
+        // It also rides on list-devices, so a client cannot pair without having seen the denylist.
+        self::assertSame([$record], $this->api->listDevices(['token' => $token])[1]['revocations']);
+
+        // Re-posting the same record is idempotent: the revoke click retries, and a duplicate must not
+        // appear twice (the client derives its epoch floor from the record COUNT).
+        $this->api->revokeDevice(['token' => $token, 'deviceId' => $deviceId2, 'record' => $record]);
+        self::assertSame([$record], $this->api->listRevocations(['token' => $token])[1]['revocations']);
+    }
+
+    public function testARevocationRecordIsRejectedUnlessItIsExactlyOneRecordShaped(): void
+    {
+        // The one place a client writes an opaque blob, so the shape check is the whole server-side
+        // defense. Everything security-relevant about the contents is checked by the client instead.
+        $token = $this->registerToken();
+        $k2 = str_repeat('2', 64);
+        $token2 = $this->loginToken();
+        $deviceId2 = $this->api->addDevice(['token' => $token2, 'authSecret' => $this->a, 'deviceKey' => $k2])[1]['deviceId'];
+        self::assertIsString($deviceId2);
+
+        foreach ([str_repeat('ab', 139), str_repeat('ab', 141), 'AB' . str_repeat('ab', 139), 'zz' . str_repeat('ab', 139), '', 12345] as $bad) {
+            $res = $this->api->revokeDevice(['token' => $token, 'deviceId' => $deviceId2, 'record' => $bad]);
+            // The device is still revoked: burning the server row already succeeded and is not undone by
+            // a record the server cannot judge. Only the record is refused, and the client is told so.
+            self::assertSame(200, $res[0]);
+            self::assertFalse($res[1]['recordStored'], 'a malformed record must be refused');
+        }
+        self::assertSame([], $this->api->listRevocations(['token' => $token])[1]['revocations']);
+
+        // Revoking with NO record at all still works, so a pre-P7 client keeps functioning.
+        $res = $this->api->revokeDevice(['token' => $token, 'deviceId' => $deviceId2]);
+        self::assertSame(200, $res[0]);
+        self::assertFalse($res[1]['recordStored']);
+    }
+
+    public function testOneAccountCannotSeeOrWriteAnotherAccountsRevocations(): void
+    {
+        $mine = $this->registerToken();
+        $record = str_repeat('cd', 140);
+        $k2 = str_repeat('2', 64);
+        $token2 = $this->loginToken();
+        $deviceId2 = $this->api->addDevice(['token' => $token2, 'authSecret' => $this->a, 'deviceKey' => $k2])[1]['deviceId'];
+        self::assertIsString($deviceId2);
+        $this->api->revokeDevice(['token' => $mine, 'deviceId' => $deviceId2, 'record' => $record]);
+
+        // A second account sees NOTHING of the first account's denylist.
+        $otherUser = str_repeat('9', 64);
+        $this->api->register([
+            'usernameHash' => $otherUser,
+            'authSecret' => $this->a,
+            'identityKey' => str_repeat('7', 64),
+            'pow' => $this->pow(),
+        ]);
+        $otherToken = $this->api->login(['usernameHash' => $otherUser, 'authSecret' => $this->a])[1]['token'];
+        self::assertIsString($otherToken);
+        self::assertSame([], $this->api->listRevocations(['token' => $otherToken])[1]['revocations']);
+        self::assertSame([$record], $this->api->listRevocations(['token' => $mine])[1]['revocations']);
+
+        // And an unauthenticated caller sees nothing at all.
+        self::assertSame(401, $this->api->listRevocations([])[0]);
+        self::assertSame(401, $this->api->listRevocations(['token' => 'nope'])[0]);
     }
 }

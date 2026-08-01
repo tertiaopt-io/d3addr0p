@@ -61,4 +61,15 @@ const baked = src
   .replace(cachePlaceholder, `const CACHE = 'deaddrop-pinned-${version}';`)
   .replace(placeholder, `const PINNED_ASSETS = ${manifestJson};`);
 writeFileSync(join(webroot, 'sw.js'), baked);
+
+// The BUILD HASH: one value covering every pinned asset in this web root. honest-limits tells users to
+// verify the published build hash before relying on the app, so the build has to actually publish one.
+// Written into the web root (served, so a user can read what their browser is running) and echoed here
+// for the release notes. It deliberately excludes /downloads and sw.js itself, exactly like the pin set.
+const fullHash = createHash('sha256').update(manifestJson).digest('hex');
+writeFileSync(
+  join(webroot, 'build.txt'),
+  `DEAD DROP build\nassets: ${Object.keys(pins).length}\nbuild-hash: ${fullHash}\ncache: deaddrop-pinned-${version}\n`,
+);
 console.log(`pinned ${Object.keys(pins).length} assets into ${join(webroot, 'sw.js')} (cache deaddrop-pinned-${version})`);
+console.log(`BUILD HASH ${fullHash}`);

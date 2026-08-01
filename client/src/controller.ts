@@ -20,7 +20,14 @@ import {
   type ChannelRecord,
 } from './idb.js';
 import { importMsk, sealUnder, openUnder, open as openVaultRecord } from './vault.js';
-import { GroupChannel, fingerprintOf, type GroupDeps, type GroupPersistence, type DeviceTarget } from './groupchannel.js';
+import {
+  GroupChannel,
+  fingerprintOf,
+  type GroupDeps,
+  type GroupPersistence,
+  type DeviceTarget,
+  type PendingWelcome,
+} from './groupchannel.js';
 import { CONTROL_BUDDY_ICON, CONTROL_PROFILE, CONTROL_AWAY } from './session.js';
 import { substituteSpecials } from './specials.js';
 import { LifetimeManager } from './lifetime.js';
@@ -43,7 +50,7 @@ function sanitizeIcon(raw: unknown): BuddyIcon | null {
   }
   return { kind, value, bg };
 }
-import type { AppController, ChannelSummary, KeyExchangeState, TransmitModel, LogEntry, IdentityProfile, BuddyIcon, AwayConfig, PeerIdentity, Buddy, GroupSummary } from './app.js';
+import type { AppController, ChannelSummary, KeyExchangeState, TransmitModel, LogEntry, IdentityProfile, BuddyIcon, AwayConfig, PeerIdentity, Buddy, BuddyVerifyInfo, BuddyVerifyBadge, GroupSummary } from './app.js';
 import type { Lifetime } from './index.js';
 
 function toHexStr(b: Uint8Array): string {
@@ -89,6 +96,10 @@ interface BuddyEntry {
   v: number;
   removed: boolean;
   group: string; // the group (category) the buddy is filed under; part of the synced per-buddy state
+  /** The account authority key (64 hex chars) this user MARKED VERIFIED for the buddy, after comparing
+   * the six-word phrase out of band. Absent until they verify. Synced with the record, so verifying on
+   * one device verifies on all of them; a later change of the buddy's actual key is a loud mismatch. */
+  vk?: string;
 }
 const DEFAULT_GROUP = 'Buddies';
 /** The buddy list keyed by normalized username, including tombstones. */
@@ -113,12 +124,14 @@ export function normalizeBuddyMap(raw: unknown): BuddyMap {
       if (u.length === 0 || e === null || typeof e !== 'object') {
         continue;
       }
-      const ent = e as { addedAt?: unknown; v?: unknown; removed?: unknown; group?: unknown };
+      const ent = e as { addedAt?: unknown; v?: unknown; removed?: unknown; group?: unknown; vk?: unknown };
+      const vk = typeof ent.vk === 'string' && /^[0-9a-f]{64}$/.test(ent.vk) ? ent.vk : '';
       out[u] = {
         addedAt: typeof ent.addedAt === 'number' ? ent.addedAt : 0,
         v: typeof ent.v === 'number' ? ent.v : 0,
         removed: ent.removed === true,
         group: typeof ent.group === 'string' && ent.group.trim().length > 0 ? ent.group : DEFAULT_GROUP,
+        ...(vk.length > 0 ? { vk } : {}),
       };
     }
   }
@@ -270,6 +283,8 @@ export class AppControllerImpl implements AppController {
               saveSelf: (conv) => this.saveSelf(conv),
               resealSelf: (conv) => this.resealSelf(conv),
               recoverySeedHex: () => this.loadAccountSeed(),
+              loadWelcomeOutbox: () => this.loadWelcomeOutbox(),
+              saveWelcomeOutbox: (entries) => this.saveWelcomeOutbox(entries),
             }
           : undefined;
       this.groupChannel = new GroupChannel(
@@ -472,7 +487,9 @@ export class AppControllerImpl implements AppController {
   /** Persist one peer's received identity control frame into the per-conversation sealed map. The
    * groupchannel has already validated the sender is a current non-self group member. */
   private async savePeerIdentity(conversationId: string, peerKey: string, controlType: number, payload: Uint8Array): Promise<void> {
-    if (this.sessions === undefined) {
+    if (this.sessions === undefined || this.historyOff) {
+      // History-off: this record is durable proof of WHO you talked to, so it is not written at all.
+      // The cost is that Get Info shows no cached profile for a conversation held in this mode.
       return;
     }
     const key = this.requireKey();
@@ -552,6 +569,18 @@ export class AppControllerImpl implements AppController {
       return;
     }
     const map = await this.loadConvHandles();
+    // A 1:1 tag is what contact verification resolves a buddy's account key through, so a GROUP chat
+    // must never displace one. Starting a group with a verified buddy used to repoint their handle at
+    // the multi-account conversation, which made their key unreadable and silently killed every
+    // verification surface, including the original 1:1 window. Prefer the more specific binding.
+    const prev = map[u];
+    if (prev !== undefined && prev !== conversationId) {
+      const prevIsOneToOne = (this.groupChannel?.peerAccountKeysFor(prev) ?? []).length === 1;
+      const nextIsOneToOne = (this.groupChannel?.peerAccountKeysFor(conversationId) ?? []).length === 1;
+      if (prevIsOneToOne && !nextIsOneToOne) {
+        return; // keep the 1:1 binding
+      }
+    }
     map[u] = conversationId;
     const key = this.requireKey();
     const sealed = await sealUnder(key, enc.encode(JSON.stringify(map)), this.convHandlesKey());
@@ -607,6 +636,173 @@ export class AppControllerImpl implements AppController {
       }
     }
     return out;
+  }
+
+  /** Resolve the buddy's CURRENT account key through the conversation tagged for that handle: exactly
+   * one cert-verified foreign account = an unambiguous anchor; anything else = '' (a group chat with
+   * several accounts, no live session yet, or nothing verifies — never guess). */
+  private buddyPeerKey(handles: Record<string, string>, username: string): string {
+    const conversationId = handles[username.trim().toLowerCase()];
+    if (conversationId === undefined) {
+      return '';
+    }
+    const keys = this.groupChannel?.peerAccountKeysFor(conversationId) ?? [];
+    return keys.length === 1 ? (keys[0] ?? '') : '';
+  }
+
+  /** Everything the Verify Buddy panel needs, in one call. `state` is precomputed here so every device
+   * and every surface (panel, list badge, channel line) agrees on what it means. */
+  async buddyVerifyInfo(username: string): Promise<BuddyVerifyInfo> {
+    const u = username.trim().toLowerCase();
+    const handles = await this.loadConvHandles();
+    const peerKey = this.buddyPeerKey(handles, u);
+    const verifiedKey = (await this.loadBuddyMap())[u]?.vk ?? '';
+    const ourKey = this.groupChannel?.accountKeyHex() ?? '';
+    const ourWords = this.groupChannel?.contactPhraseFor(ourKey) ?? '';
+    const theirWords = peerKey.length > 0 ? (this.groupChannel?.contactPhraseFor(peerKey) ?? '') : '';
+    // Comparable only when BOTH halves actually rendered. A device that cannot derive its own phrase
+    // (an older wasm, or no account key yet) must not present a half-empty panel as if it worked.
+    const comparable = ourWords.length > 0 && theirWords.length > 0;
+    let state: BuddyVerifyInfo['state'];
+    if (verifiedKey.length > 0) {
+      if (peerKey.length === 0) {
+        // Pinned, but the current key is unreadable right now (no live session, or the tagged
+        // conversation has several accounts in it). Say so. Claiming 'verified' here was the defect
+        // that let one group chat silently disable the alarm for a verified buddy.
+        state = 'stale';
+      } else {
+        state = peerKey !== verifiedKey ? 'changed' : 'verified';
+      }
+    } else {
+      state = comparable ? 'none' : 'unavailable';
+    }
+    return {
+      peerKey,
+      peerFingerprint: peerKey.length > 0 ? fingerprintOf(peerKey) : '',
+      ourFingerprint: await this.accountFingerprint(),
+      ourWords,
+      theirWords,
+      verifiedKey,
+      state,
+    };
+  }
+
+  /** The verification badge per buddy for the list, in ONE call. Only buddies with a stored key appear.
+   * Three outcomes, and the third matters: 'verified' (checked and matching), 'changed' (positive
+   * mismatch), 'stale' (pinned but not checkable right now). A stale pin must never render as a green
+   * check, or a user reads reassurance the app cannot actually back. */
+  async buddyVerifyStates(usernames: readonly string[]): Promise<Record<string, BuddyVerifyBadge>> {
+    const map = await this.loadBuddyMap();
+    const handles = await this.loadConvHandles();
+    const out: Record<string, BuddyVerifyBadge> = {};
+    for (const name of usernames) {
+      const u = name.trim().toLowerCase();
+      const vk = map[u]?.vk ?? '';
+      if (vk.length === 0 || map[u]?.removed === true) {
+        continue;
+      }
+      const peerKey = this.buddyPeerKey(handles, u);
+      out[name] = peerKey.length === 0 ? 'stale' : peerKey !== vk ? 'changed' : 'verified';
+    }
+    return out;
+  }
+
+  /** Record that the user compared the words and confirmed them: pin `peerKey` for this buddy and sync
+   * it to our other devices. Refuses a key that does not MATCH what the conversation currently shows,
+   * so a stale panel can never pin an attacker's key that arrived after it was rendered. */
+  async markBuddyVerified(username: string, peerKey: string, expectedPrev = ''): Promise<boolean> {
+    const u = username.trim().toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(peerKey)) {
+      return false;
+    }
+    const handles = await this.loadConvHandles();
+    if (this.buddyPeerKey(handles, u) !== peerKey) {
+      return false; // the key on screen is no longer the key in the group: re-open and re-compare
+    }
+    const map = await this.loadBuddyMap();
+    const existing = map[u];
+    if (existing === undefined || existing.removed) {
+      return false;
+    }
+    // The panel was rendered against a specific PRIOR pin (empty for a first verification). If a
+    // sibling device changed it since, this tap was aimed at a screen that no longer describes the
+    // world, so it must not commit. Cheap, and it closes the stale-panel re-trust race.
+    if ((existing.vk ?? '') !== expectedPrev) {
+      return false;
+    }
+    map[u] = { ...existing, vk: peerKey, v: this.now() };
+    await this.saveBuddyMap(map);
+    this.groupChannel?.syncBuddies();
+    return true;
+  }
+
+  /** Drop the stored verification for a buddy (kept as a plain field clear; the record itself stays). */
+  async clearBuddyVerified(username: string): Promise<void> {
+    const u = username.trim().toLowerCase();
+    const map = await this.loadBuddyMap();
+    const existing = map[u];
+    if (existing === undefined || existing.vk === undefined) {
+      return;
+    }
+    const { vk: _vk, ...rest } = existing;
+    map[u] = { ...rest, v: this.now() };
+    await this.saveBuddyMap(map);
+    this.groupChannel?.syncBuddies();
+  }
+
+  private historyKey(): string {
+    return `history:${this.account}`;
+  }
+
+  /** Read the stored history-off flag into the cached field. Called once, inside unlock. */
+  private async hydrateHistoryMode(): Promise<void> {
+    this.historyOff = false;
+    if (this.sessions === undefined) {
+      return;
+    }
+    try {
+      const rec = await this.sessions.load(this.historyKey());
+      if (rec !== undefined) {
+        const key = this.requireKey();
+        const raw = await openUnder(key, rec.sealed, this.historyKey());
+        this.historyOff = JSON.parse(dec.decode(raw)) === true;
+      }
+    } catch {
+      this.historyOff = false; // an unreadable setting means the normal, durable mode
+    }
+    this.applyHistoryMode();
+  }
+
+  /** Push the resolved mode into the two stores that hold message content and conversation rows. */
+  private applyHistoryMode(): void {
+    this.keyvault.setEphemeral(this.historyOff);
+    this.channels.setEphemeral(this.historyOff);
+  }
+
+  /** Whether this device is holding messages in memory only. */
+  historyOffEnabled(): Promise<boolean> {
+    return Promise.resolve(this.historyOff);
+  }
+
+  /** Turn history-off on or off for this device.
+   *
+   * Turning it ON also DESTROYS the message history already on this device, because leaving it there
+   * would make the setting a promise the device does not keep. That is a crypto-erase (the wrapped
+   * per-message keys go with the records), and it cannot be undone. Turning it OFF simply resumes
+   * writing new messages to disk; whatever was held in memory stays in memory until the session ends. */
+  async setHistoryOff(on: boolean, purgeExisting = true): Promise<void> {
+    if (this.sessions === undefined) {
+      return;
+    }
+    const key = this.requireKey();
+    const sealed = await sealUnder(key, enc.encode(JSON.stringify(on)), this.historyKey());
+    await this.sessions.save({ conversationId: this.historyKey(), sealed });
+    this.historyOff = on;
+    this.applyHistoryMode();
+    if (on && purgeExisting) {
+      await this.keyvault.purgeDurable();
+      await this.channels.purgeDurable();
+    }
   }
 
   private buddiesKey(): string {
@@ -673,6 +869,11 @@ export class AppControllerImpl implements AppController {
   // the sole writer of this account's store, so the cache cannot go stale under another writer. Null =
   // not loaded yet (or account switched); reset wherever selfConvId resets.
   private selfGroupIdsCache: Set<string> | null = null;
+  /** History-off (ephemeral) mode for THIS device, resolved once at unlock. See setHistoryOff. */
+  private historyOff = false;
+  /** Away-reply cooldowns held in memory while history-off, so the cooldown still works without
+   * leaving a durable per-conversation timestamp (which is proof a conversation happened at time T). */
+  private readonly awayDedupeMem = new Map<string, number>();
 
   private async loadSelfGroupIds(): Promise<Set<string>> {
     if (this.selfGroupIdsCache !== null) {
@@ -702,6 +903,52 @@ export class AppControllerImpl implements AppController {
     this.selfGroupIdsCache = new Set(ids); // keep the hot-path cache current with the durable copy
     const sealed = await sealUnder(this.requireKey(), enc.encode(JSON.stringify([...ids])), this.selfGroupsKey());
     await this.sessions.save({ conversationId: this.selfGroupsKey(), sealed });
+  }
+
+  private welcomeOutboxKey(): string {
+    return `welcome-outbox:${this.account ?? ''}`;
+  }
+
+  /** The pending-Welcome outbox, sealed under the MSK per account. A founding Welcome is published
+   * exactly once into a bus that holds it only in memory (and clamps its TTL to a day), so a gateway
+   * restart, a crash, or a sibling that stays offline long enough loses it with nobody informed. The
+   * SENDER keeps its own durable copy and re-publishes on reconnect; the gateway stays amnesiac, so
+   * nothing about the at-rest threat model changes (this blob is sealed device-local, like the buddy
+   * list). See [self-group split, 2026-08-01]. */
+  private async loadWelcomeOutbox(): Promise<PendingWelcome[]> {
+    if (this.sessions === undefined || this.account === null) {
+      return [];
+    }
+    const rec = await this.sessions.load(this.welcomeOutboxKey());
+    if (rec === undefined) {
+      return [];
+    }
+    try {
+      const raw: unknown = JSON.parse(dec.decode(await openUnder(this.requireKey(), rec.sealed, this.welcomeOutboxKey())));
+      if (!Array.isArray(raw)) {
+        return [];
+      }
+      return raw.filter((e): e is PendingWelcome => {
+        const c = e as Partial<PendingWelcome> | null;
+        return (
+          c !== null &&
+          typeof c.conversationId === 'string' &&
+          typeof c.deviceKey === 'string' &&
+          typeof c.welcomeHex === 'string' &&
+          typeof c.createdAt === 'number'
+        );
+      });
+    } catch {
+      return []; // another account's record on this device, or a corrupt blob
+    }
+  }
+
+  private async saveWelcomeOutbox(entries: readonly PendingWelcome[]): Promise<void> {
+    if (this.sessions === undefined || this.account === null) {
+      return;
+    }
+    const sealed = await sealUnder(this.requireKey(), enc.encode(JSON.stringify(entries)), this.welcomeOutboxKey());
+    await this.sessions.save({ conversationId: this.welcomeOutboxKey(), sealed });
   }
 
   /** The buddy list, sealed under the MSK per account. Stored as a per-username map with a change version
@@ -835,7 +1082,14 @@ export class AppControllerImpl implements AppController {
       // removal beats an add, so a same-millisecond add-vs-remove of one buddy on two devices converges to
       // removed on both rather than each keeping its own. (Two adds at one version agree on presence, so a
       // cosmetic addedAt difference is harmless.)
-      const newer = cur === undefined || inEnt.v > cur.v || (inEnt.v === cur.v && inEnt.removed && !cur.removed);
+      let newer = cur === undefined || inEnt.v > cur.v || (inEnt.v === cur.v && inEnt.removed && !cur.removed);
+      // Same-version, same-liveness tiebreak for the verified key (mirrors the group-alias tiebreak):
+      // when two devices stamp the same millisecond, the lexically larger vk wins on BOTH, so they
+      // converge on one answer instead of each keeping its own. An absent vk never beats a present one
+      // here; a genuine unverify carries a newer version and wins the plain LWW race above.
+      if (!newer && cur !== undefined && inEnt.v === cur.v && inEnt.removed === cur.removed) {
+        newer = (inEnt.vk ?? '') > (cur.vk ?? '');
+      }
       if (newer) {
         local[u] = inEnt;
         changed = true;
@@ -1340,6 +1594,9 @@ export class AppControllerImpl implements AppController {
   }
 
   private async awayDedupeAt(conversationId: string): Promise<number | null> {
+    if (this.historyOff) {
+      return this.awayDedupeMem.get(conversationId) ?? null; // cooldown without a durable timestamp
+    }
     if (this.sessions === undefined) {
       return null;
     }
@@ -1358,6 +1615,12 @@ export class AppControllerImpl implements AppController {
   }
 
   private async setAwayDedupe(conversationId: string, at: number): Promise<void> {
+    if (this.historyOff) {
+      // A durable per-conversation timestamp is proof a conversation happened at time T, so in
+      // history-off mode the cooldown lives in memory for the session instead.
+      this.awayDedupeMem.set(conversationId, at);
+      return;
+    }
     if (this.sessions === undefined) {
       return;
     }
@@ -1443,8 +1706,8 @@ export class AppControllerImpl implements AppController {
   /** Mint `n` fresh key packages (hex) for this device to publish to the directory, so peers can add
    * it to groups. After a provisioned device adopts its certificate, these carry the authorized
    * credential. The app publishes them via the account client (the last one is the last-resort). */
-  keyPackages(n: number): Promise<string[]> {
-    return Promise.resolve(this.requireGroup().freshKeyPackages(n).map((kp) => toHexStr(kp)));
+  async keyPackages(n: number): Promise<string[]> {
+    return (await this.requireGroup().freshKeyPackages(n)).map((kp) => toHexStr(kp));
   }
 
   /** Recovery: make THIS device an authorized seed-holder by entering the account recovery secret.
@@ -1482,6 +1745,47 @@ export class AppControllerImpl implements AppController {
   /** This device's own certificate epoch (0 if unauthorized or before an identity exists). */
   certEpoch(): Promise<number> {
     return Promise.resolve(this.groupChannel?.certEpoch() ?? 0);
+  }
+
+  /** ADR-022 P7: mint a signed revocation record naming a device's signature key, so every device of
+   * this account refuses it at the gate no matter what epoch it certifies itself at. Returns the record
+   * as hex to publish, or null when this device holds no account key (only a seed-holder can sign one).
+   * Never throws: a failure here must not block the server-side revoke, which is what cuts the sessions.
+   */
+  async revokeDeviceKey(deviceSigKeyHex: string, issuedSeq: number): Promise<string | null> {
+    if (this.groupChannel === null) {
+      return null;
+    }
+    try {
+      return await this.groupChannel.revokeDeviceKey(deviceSigKeyHex, issuedSeq);
+    } catch {
+      return null;
+    }
+  }
+
+  /** ADR-022 P7: accept revocation records fetched from the control plane. Each is verified against our
+   * own account key inside the crypto layer; anything that does not check out is discarded. Returns how
+   * many were new to this device. */
+  async ingestRevocations(records: readonly string[]): Promise<number> {
+    if (this.groupChannel === null) {
+      return 0;
+    }
+    try {
+      return await this.groupChannel.ingestRevocations(records);
+    } catch {
+      return 0;
+    }
+  }
+
+  /** The revocation-record count (the derived epoch) and this device's certification floor. Diagnostic:
+   * a pairing that fails at the gate is explained by these two numbers plus the leaf's own epoch. */
+  revocationState(): Promise<{ revoked: number; floor: number }> {
+    return Promise.resolve(this.groupChannel?.revocationState() ?? { revoked: 0, floor: 0 });
+  }
+
+  /** Whether we hold a verifying revocation record for this device key. */
+  isDeviceRevoked(deviceSigKeyHex: string): Promise<boolean> {
+    return Promise.resolve(this.groupChannel?.isDeviceRevoked(deviceSigKeyHex) ?? false);
   }
 
   /** A short fingerprint of this account's authorization key (AAK) — the stable account identity shared
@@ -1661,13 +1965,16 @@ export class AppControllerImpl implements AppController {
    * its certificate (saveSelf is create-if-absent, so adoption needs an explicit overwrite to persist
    * the now-authorized identity). The signature key is unchanged, so the contact stays stable. Also
    * marks this device group-ready so it may now publish key packages to the directory. */
-  private async resealSelf(conv: GroupConversationLike): Promise<void> {
+  private async resealSelf(conv: GroupConversationLike): Promise<boolean> {
+    // A locked vault (mskRaw null) cannot seal. Report that honestly instead of no-opping: a caller
+    // about to publish something derived from in-memory key material must not proceed.
     if (this.live === undefined || this.sessions === undefined || this.mskRaw === null) {
-      return;
+      return false;
     }
     const sealed = this.live.sealConversation(conv, this.mskRaw);
     await this.sessions.save({ conversationId: this.selfKey(), sealed });
     await this.sessions.save({ conversationId: `authorized:${this.account}`, sealed: new Uint8Array([1]) });
+    return true;
   }
 
   /** True when this device can be added to a group: it is the seed-holder (holds the account seed) or
@@ -1840,6 +2147,9 @@ export class AppControllerImpl implements AppController {
       this.mskRaw = raw.slice();
     }
     raw.fill(0);
+    // Resolve history-off BEFORE connecting, so the very first message of the session is routed by a
+    // settled flag rather than racing the read. Cached in a field: this must not decrypt per message.
+    await this.hydrateHistoryMode();
     // A reload lost the in-memory expiry timers; erase anything already overdue before showing it.
     await this.lifetime?.sweepExpired();
     return { ok: true, created };
@@ -1901,7 +2211,30 @@ export class AppControllerImpl implements AppController {
     // even one whose peer never comes online, is never flagged (liveness is not the signal).
     return out
       .filter((c) => !hidden.has(c.id))
-      .map((c) => (this.groupChannel?.isUnlinkedConversationId(c.id) === true ? { ...c, preview: 'no verified device can receive here' } : c));
+      .map((c) => {
+        // A row shown as a channel that the self-classifier REFUSES for a reason that is NOT "this is a
+        // genuine peer" (a member of a different account) is a probable mis-classified own-devices group
+        // — the ghost that will not sync. Surface the classifier's reason as the row subtitle so a stuck
+        // sync can be diagnosed ON SCREEN (Chrome on iOS has no usable console). A genuine peer chat
+        // ("belongs to a different account") is left looking normal. Display-time only, never persisted.
+        const reason = this.groupChannel?.selfClassificationReason?.(c.id);
+        if (
+          reason !== undefined &&
+          reason !== '' &&
+          reason !== 'self' &&
+          reason !== 'no such conversation' &&
+          reason.indexOf('different account') === -1
+        ) {
+          return { ...c, preview: 'self-group not recognized: ' + reason };
+        }
+        if (this.groupChannel?.heldConversationIds().includes(c.id) !== true) {
+          return { ...c, preview: 'no live crypto session (dead ghost)' };
+        }
+        if (this.groupChannel?.isUnlinkedConversationId(c.id) === true) {
+          return { ...c, preview: 'no verified device can receive here' };
+        }
+        return c;
+      });
   }
 
   /** The hidden self-group never lists as a channel (it is reached as Note to Self). A summary for it
@@ -1935,6 +2268,21 @@ export class AppControllerImpl implements AppController {
     for (const c of rows) {
       const isSelf = hidden.has(c.id) || this.groupChannel?.isSelfConversationId(c.id) === true;
       if (!isSelf) {
+        // A held conversation shown as a channel that the classifier REFUSES as self. When it should
+        // have been self (a raced/mis-timed self-group mint), it lingers as a ghost and buddy sync is
+        // withheld. Log the classifier's own reason so a stuck sync is diagnosed by READING the cause
+        // (member with no cert, foreign account, cert not settled) instead of guessing at the roster.
+        // Read-only; never changes behavior. Only for conversations this device actually holds.
+        const reason = this.groupChannel?.selfClassificationReason?.(c.id);
+        if (reason !== undefined && reason !== '' && reason !== 'no such conversation') {
+          console.warn(`self-classification: conversation ${c.id.slice(0, 8)} is not a self-group: ${reason}`);
+        } else if (this.groupChannel?.heldConversationIds().includes(c.id) !== true) {
+          // A channel row shown to the user for which we hold NO live crypto session: a stale summary
+          // left by a join that never completed (or whose wasm state did not persist). It can never sync
+          // or decrypt, so it lingers as a dead ghost. Name it so a stuck sync is not a silent console.
+          // (sweepDeadChannels deletes these on connect; logging here catches one that slipped through.)
+          console.warn(`self-classification: conversation ${c.id.slice(0, 8)} has a summary but no live crypto session (dead ghost)`);
+        }
         continue;
       }
       hidden.add(c.id);
@@ -1950,7 +2298,54 @@ export class AppControllerImpl implements AppController {
     if (changed) {
       await this.recordSelfGroupIds(hidden);
     }
+    await this.healDeadSelfGroups(hidden);
     return hidden;
+  }
+
+  /** SG2 SELF-HEAL + artifact cleanup. A self-group poisoned by a frozen certless leaf can never be
+   * repaired in place (MLS never rewrites a leaf credential): it never syncs, and it used to sit there
+   * forever while the user closed it by hand on every device (or, worse, never realized). Sweep the
+   * RECORDED self-groups, abandon any the crypto layer agrees is provably dead, and clean up what it
+   * leaves behind (its channel summary and its recorded id), so the normal formation path mints a clean
+   * replacement on the next trigger.
+   *
+   * Safety rests in the crypto layer, which refuses unless the group is recorded-self AND trusts only
+   * our account AND has NO verified sibling — so a healthy self-group, and any peer conversation, are
+   * never touched. Best-effort throughout: a failure here must never break a login. */
+  private async healDeadSelfGroups(recordedSelfIds: ReadonlySet<string>): Promise<void> {
+    const ch = this.groupChannel;
+    if (ch === null || ch === undefined || recordedSelfIds.size === 0) {
+      return;
+    }
+    const held = new Set(ch.heldConversationIds());
+    let healed = false;
+    for (const id of recordedSelfIds) {
+      if (!held.has(id) || ch.isUnlinkedConversationId(id) !== true) {
+        continue; // not held here, or still reachable: leave it alone
+      }
+      let abandoned = false;
+      try {
+        abandoned = await ch.abandonDeadSelfGroup(id, true); // recorded-self: this id is in our own set
+      } catch {
+        continue; // refused: the safe outcome
+      }
+      if (!abandoned) {
+        continue;
+      }
+      healed = true;
+      console.warn(`self-heal: abandoned a dead own-devices group (${id.slice(0, 8)}); a clean one will form`);
+      // Clean the artifacts it leaves behind: its channel summary (so no ghost row survives) and its
+      // recorded id (so a NEW self-group is not mistaken for this dead one).
+      await this.channels.delete(id).catch(() => {
+        /* best-effort */
+      });
+    }
+    if (healed) {
+      const remaining = new Set([...recordedSelfIds].filter((id) => ch.heldConversationIds().includes(id)));
+      await this.recordSelfGroupIds(remaining).catch(() => {
+        /* best-effort; recomputed on the next sweep */
+      });
+    }
   }
 
   /** Delete every channel summary whose conversation the restored WASM no longer holds (see the caller
@@ -2031,6 +2426,23 @@ export class AppControllerImpl implements AppController {
       // ever read them (the roster's identities are provably dead). Words only; nothing is deleted.
       log.push({ kind: 'system', text: '» no verified device on this channel · sent messages may be unreachable' });
     }
+    // Contact verification state for THIS conversation, computed once and used three ways: the system
+    // line below, the honest header label, and the send gate. Missing data never warns (an offline
+    // session is not an attack); only a positive mismatch does.
+    let verifyState: TransmitModel['verifyState'];
+    if (!isSelf) {
+      const handle = await this.handleForConversation(id);
+      const vk = handle !== null ? ((await this.loadBuddyMap())[handle]?.vk ?? '') : '';
+      const keys = this.groupChannel?.peerAccountKeysFor(id) ?? [];
+      if (vk.length > 0) {
+        verifyState = keys.length !== 1 ? 'stale' : keys[0] !== vk ? 'changed' : 'verified';
+      } else {
+        verifyState = keys.length === 1 ? 'none' : 'unavailable';
+      }
+      if (verifyState === 'changed') {
+        log.push({ kind: 'system', text: '» identity changed · this is not the key you verified for this buddy · confirm with them before trusting this channel' });
+      }
+    }
     // ONE read of this conversation's stored messages, shared by the arm loop and the log build:
     // openChannel is the hottest path in the app (every send, every inbound message in the open
     // conversation, every heal), and it used to getAll the ENTIRE keyvault twice per call.
@@ -2056,7 +2468,8 @@ export class AppControllerImpl implements AppController {
     // message that was held unarmed (hold-until-seen). Outbound messages were armed when sent.
     for (const v of convRecords) {
       if (v.direction === 'in') {
-        await this.lifetime?.armOnView(v.messageId);
+        // Hand over the record we just listed: armOnView re-reads only when it actually has to write.
+        await this.lifetime?.armOnView(v.messageId, v);
       }
     }
     const records = [...convRecords].sort((a, b) => a.storedAtMs - b.storedAtMs);
@@ -2140,8 +2553,11 @@ export class AppControllerImpl implements AppController {
       peer,
       fingerprint: isSelf ? null : (summary?.fingerprint ?? null),
       selfNote: isSelf,
+      // Only the self-group view carries the split diagnostic (roster size + Welcome counters).
+      ...(isSelf ? { selfDiag: this.groupChannel?.selfGroupDiagnostic() ?? '' } : {}),
       peerHandle,
       peerIsBuddy,
+      ...(verifyState !== undefined ? { verifyState } : {}),
       log,
       compose: '',
       conversationId: id,

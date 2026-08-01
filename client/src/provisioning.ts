@@ -258,6 +258,12 @@ export interface ProvisioningDeps {
   provisionSeal?: ((recipPub: Uint8Array, plaintext: Uint8Array) => Uint8Array) | undefined;
   provisionOpen?: ((recipSecret: Uint8Array, sealedBox: Uint8Array) => Uint8Array) | undefined;
   authorizeScannedDevice?: ((deviceSigKey: Uint8Array, certEpoch: number) => Uint8Array) | undefined;
+  /** The epoch to MINT a new device's certificate at. It must be at least the account's authorization
+   * floor, or the certificate is refused by every member the moment the new device is staged into a
+   * group ("certificate epoch below floor"). This was hard-coded to 0, which meant that on any account
+   * that had EVER revoked a device the floor was above 0 and every paired device was dead on arrival:
+   * pairing reported success, the server row was created, and the add then failed forever. */
+  mintEpoch(): number;
 }
 
 const WINDOW_MS = 120_000; // an add-a-device window; the review hard-caps this at 300s
@@ -313,7 +319,9 @@ export class Provisioning {
     this.role = 'seedholder';
     this.provMailbox = provMailbox;
     this.sessionNonce = this.deps.random(32);
-    this.certEpoch = 0; // the account's current epoch; P6 manages bumps
+    // The account's CURRENT epoch, not 0. It is bound into the Challenge below and therefore into the
+    // six-word SAS both sides compare, so it has to be settled here, before the Challenge is published.
+    this.certEpoch = this.deps.mintEpoch();
     this.seenRequests.clear();
     this.pending = null;
     this.deps.subscribe(provMailbox);
@@ -453,14 +461,23 @@ export class Provisioning {
       return;
     }
     try {
+      // The QR flow has no window and no Challenge, so certEpoch is never set by openWindow: read the
+      // account's epoch here. Minting at the stale field (0) is what bricked every scanned device.
+      this.certEpoch = this.deps.mintEpoch();
       const grant = this.deps.authorizeScannedDevice(parsed.deviceSigKey, this.certEpoch);
       const box = this.deps.provisionSeal(parsed.ephPub, grant);
       const mailbox = await deriveQrReplyMailbox(parsed.ephPub);
       this.deps.publish(mailbox, encodeSealedGrant(box));
       // Carry the scanned device's key so the seed-holder can poll it into the self-group by key.
       this.deps.pushEvent('device-added', { deviceKey: toHex(parsed.deviceSigKey) });
-    } catch {
-      this.deps.pushEvent('provisioning-error', { detail: 'could not authorize that device' });
+    } catch (err: unknown) {
+      // Carry the REAL reason through. This used to collapse every failure into one generic sentence,
+      // which is how a mint refused for a concrete, printable reason (an epoch below the account floor,
+      // a key on the revocation denylist) reached the user as "could not authorize that device" and
+      // stayed undiagnosable across days of retries. The messages this layer raises are counters and
+      // states, never key material.
+      const detail = err instanceof Error && err.message !== '' ? err.message : 'could not authorize that device';
+      this.deps.pushEvent('provisioning-error', { detail });
     }
   }
 

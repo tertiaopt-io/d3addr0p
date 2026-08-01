@@ -25,14 +25,18 @@ export function sasWord(index: number): string {
   return onset + vowel + coda;
 }
 
-/** Render the SAS digest (>=9 bytes) as six space-separated words from its first 66 bits. */
-export function renderSas(digest: Uint8Array): string {
-  if (digest.length < 9) {
+/** Render the first `count * 11` bits of a digest as space-separated words. Six words (66 bits) is the
+ * provisioning SAS, where a fresh nonce reduces an attacker to one online guess per attempt. The
+ * contact identity phrase uses EIGHT (88 bits) because it carries no nonce: it is a standing target an
+ * attacker can grind offline for as long as he likes, so the rendered width, not the protocol, is what
+ * bounds him. */
+export function renderSasWords(digest: Uint8Array, count: number): string {
+  if (digest.length * 8 < count * 11) {
     throw new Error('SAS digest too short');
   }
   const words: string[] = [];
   let bitpos = 0;
-  for (let i = 0; i < 6; i++) {
+  for (let i = 0; i < count; i++) {
     let value = 0;
     for (let b = 0; b < 11; b++) {
       const byte = digest[bitpos >> 3] ?? 0;
@@ -45,6 +49,14 @@ export function renderSas(digest: Uint8Array): string {
   return words.join(' ');
 }
 
+/** The six-word provisioning SAS (66 bits). */
+export function renderSas(digest: Uint8Array): string {
+  return renderSasWords(digest, 6);
+}
+
+/** How many words a contact identity phrase carries. See renderSasWords for why it is wider. */
+export const CONTACT_PHRASE_WORDS = 8;
+
 function hexToBytes(h: string): Uint8Array {
   const out = new Uint8Array(h.length / 2);
   for (let i = 0; i < out.length; i++) {
@@ -56,4 +68,17 @@ function hexToBytes(h: string): Uint8Array {
 /** Render a SAS digest given as hex (the form `sasDigestHex` returns). */
 export function renderSasHex(digestHex: string): string {
   return renderSas(hexToBytes(digestHex));
+}
+
+/** The contact identity phrase (8 words) from a hex digest; '' for an empty or short digest, so a
+ * missing key can never render a confident-looking phrase. */
+export function renderContactPhraseHex(digestHex: string): string {
+  if (digestHex.length < CONTACT_PHRASE_WORDS * 11 / 4) {
+    return '';
+  }
+  try {
+    return renderSasWords(hexToBytes(digestHex), CONTACT_PHRASE_WORDS);
+  } catch {
+    return '';
+  }
 }

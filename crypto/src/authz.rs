@@ -26,6 +26,14 @@ use sha2::{Digest, Sha256};
 const CERT_DOMAIN: &[u8] = b"deaddrop-device-cert-v1";
 /// Domain separation for the provisioning short-authentication-string digest.
 const SAS_DOMAIN: &[u8] = b"deaddrop-vcode-v2";
+/// Domain separation for the CONTACT identity phrase (ONE account key, rendered per side). Distinct
+/// from SAS_DOMAIN so a provisioning transcript can never be replayed as a contact phrase or vice
+/// versa, and versioned so a future scheme change cannot silently collide with this one.
+const CONTACT_IDENT_DOMAIN: &[u8] = b"deaddrop-contact-ident-v1";
+/// Iteration count for the contact identity digest. Each candidate an attacker tests costs this many
+/// hashes, multiplying an offline search by ~2^12 on top of the rendered width. Signal's safety
+/// number uses the same trick (5200 iterations) for the same reason.
+const CONTACT_IDENT_ROUNDS: u32 = 5200;
 
 /// Marks an authorized credential identity: `magic | aak_pub(32) | cert_epoch(8) | cert(64) | label`.
 /// A legacy or v1 identity lacks this magic and parses as unauthorized (fail-closed).
@@ -94,6 +102,35 @@ pub(crate) fn sas_digest(session_nonce: &[u8], key_a: &[u8], key_b: &[u8], cert_
     h.update(hi);
     h.update(cert_epoch.to_be_bytes());
     h.finalize().into()
+}
+
+/// The contact identity digest: an iterated hash of ONE account's authority public key.
+///
+/// Per side on purpose. An earlier design hashed BOTH keys into a single shared phrase, which looked
+/// symmetric and convenient and was broken: because a man in the middle chooses the key he shows to
+/// each side, he does not need a preimage on a fixed phrase, only a COLLISION between two sets he
+/// generates himself. That is a birthday search at half the rendered width, and at six words it was
+/// hours of offline work, which defeats the exact attack this feature exists to stop.
+///
+/// Deriving each side's words from that side's key alone makes the honest keys FIXED targets: the
+/// attacker must find a second preimage for each direction independently, and both people compare
+/// both halves. The iteration count multiplies the cost of every candidate he tests.
+pub(crate) fn contact_ident_digest(aak: &[u8]) -> [u8; 32] {
+    let mut acc: [u8; 32] = {
+        let mut h = Sha256::new();
+        h.update(CONTACT_IDENT_DOMAIN);
+        h.update(aak);
+        h.finalize().into()
+    };
+    // Each round rebinds the key, so a shortcut through the chain still has to know it.
+    for _ in 0..CONTACT_IDENT_ROUNDS {
+        let mut h = Sha256::new();
+        h.update(CONTACT_IDENT_DOMAIN);
+        h.update(acc);
+        h.update(aak);
+        acc = h.finalize().into();
+    }
+    acc
 }
 
 /// An authorized credential identity: the account key, the certificate epoch, the certificate, and

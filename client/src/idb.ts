@@ -76,28 +76,91 @@ function randomBytes(n: number): Uint8Array {
   return b;
 }
 
-/** KeyvaultStore (vault.ts) backed by the `messages` object store. */
+/** How many memory-held records one conversation may accumulate in history-off mode before the oldest
+ * are dropped. Inline images ride inside a record (32 KiB bucket budget), so this is a memory ceiling,
+ * not a policy: the chat simply renders fewer entries once it is hit. */
+const EPHEMERAL_PER_CONV_MAX = 500;
+
+/** KeyvaultStore (vault.ts) backed by the `messages` object store, with an optional HISTORY-OFF mode.
+ *
+ * History-off does not SKIP writes, it REDIRECTS them to memory. Skipping would render an empty chat,
+ * because every repaint re-reads this store (there is no in-memory view log), and it would strand the
+ * lifetime, burn-on-read and revoke machinery that all operate through these same methods. Redirecting
+ * keeps every one of those working while nothing new touches disk.
+ *
+ * The routing rule that matters: a `put` goes to memory only when the record is NOT already on disk.
+ * A tombstone written by the burn latch, or a record armed on first view, MUST land back on disk when
+ * that is where it came from; otherwise the latch is lost on reload and a burned message becomes
+ * readable again. Every put in the codebase is preceded by a get, so the extra lookup is cheap and
+ * only happens in this mode. */
 export class IndexedDbKeyvaultStore implements KeyvaultStore {
+  private ephemeral = false;
+  private readonly mem = new Map<string, VaultRecord>();
+
   constructor(private readonly db: IDBDatabase) {}
 
-  get(messageId: string): Promise<VaultRecord | undefined> {
+  /** Turn history-off on or off for this device. Leaving the mode drops whatever memory held. */
+  setEphemeral(on: boolean): void {
+    this.ephemeral = on;
+    if (!on) {
+      this.mem.clear();
+    }
+  }
+
+  isEphemeral(): boolean {
+    return this.ephemeral;
+  }
+
+  async get(messageId: string): Promise<VaultRecord | undefined> {
+    const held = this.mem.get(messageId);
+    if (held !== undefined) {
+      return held;
+    }
     const store = this.db.transaction(STORE_MESSAGES, 'readonly').objectStore(STORE_MESSAGES);
     return reqDone(store.get(messageId) as IDBRequest<VaultRecord | undefined>);
   }
 
   async put(record: VaultRecord): Promise<void> {
-    const store = this.db.transaction(STORE_MESSAGES, 'readwrite').objectStore(STORE_MESSAGES);
-    await reqDone(store.put(record));
+    if (this.mem.has(record.messageId)) {
+      this.mem.set(record.messageId, record); // already memory-held: keep it there
+      return;
+    }
+    if (this.ephemeral) {
+      const store = this.db.transaction(STORE_MESSAGES, 'readonly').objectStore(STORE_MESSAGES);
+      const onDisk = await reqDone(store.get(record.messageId) as IDBRequest<VaultRecord | undefined>);
+      if (onDisk === undefined) {
+        this.mem.set(record.messageId, record);
+        this.evictOldest(record.conversationId);
+        return;
+      }
+      // It IS on disk (written before the mode was turned on): its update belongs on disk too.
+    }
+    const rw = this.db.transaction(STORE_MESSAGES, 'readwrite').objectStore(STORE_MESSAGES);
+    await reqDone(rw.put(record));
+  }
+
+  /** Keep the newest EPHEMERAL_PER_CONV_MAX memory records for one conversation. */
+  private evictOldest(conversationId: string): void {
+    const mine = [...this.mem.values()].filter((v) => v.conversationId === conversationId);
+    if (mine.length <= EPHEMERAL_PER_CONV_MAX) {
+      return;
+    }
+    mine
+      .sort((a, b) => a.storedAtMs - b.storedAtMs)
+      .slice(0, mine.length - EPHEMERAL_PER_CONV_MAX)
+      .forEach((v) => this.mem.delete(v.messageId));
   }
 
   async delete(messageId: string): Promise<void> {
+    this.mem.delete(messageId);
     const store = this.db.transaction(STORE_MESSAGES, 'readwrite').objectStore(STORE_MESSAGES);
     await reqDone(store.delete(messageId));
   }
 
-  list(): Promise<readonly VaultRecord[]> {
+  async list(): Promise<readonly VaultRecord[]> {
     const store = this.db.transaction(STORE_MESSAGES, 'readonly').objectStore(STORE_MESSAGES);
-    return reqDone(store.getAll() as IDBRequest<VaultRecord[]>);
+    const disk = await reqDone(store.getAll() as IDBRequest<VaultRecord[]>);
+    return this.mem.size === 0 ? disk : [...disk, ...this.mem.values()];
   }
 
   /** Only ONE conversation's records, via the v4 conversationId index: opening a chat must not pay a
@@ -105,11 +168,22 @@ export class IndexedDbKeyvaultStore implements KeyvaultStore {
    * Falls back to a filtered full scan if the index is missing (a DB opened before the v4 upgrade). */
   async listByConversation(conversationId: string): Promise<readonly VaultRecord[]> {
     const store = this.db.transaction(STORE_MESSAGES, 'readonly').objectStore(STORE_MESSAGES);
-    if (store.indexNames.contains(IDX_MESSAGES_BY_CONV)) {
-      return reqDone(store.index(IDX_MESSAGES_BY_CONV).getAll(IDBKeyRange.only(conversationId)) as IDBRequest<VaultRecord[]>);
+    const disk = store.indexNames.contains(IDX_MESSAGES_BY_CONV)
+      ? await reqDone(store.index(IDX_MESSAGES_BY_CONV).getAll(IDBKeyRange.only(conversationId)) as IDBRequest<VaultRecord[]>)
+      : (await reqDone(store.getAll() as IDBRequest<VaultRecord[]>)).filter((v) => v.conversationId === conversationId);
+    if (this.mem.size === 0) {
+      return disk;
     }
-    const all = await reqDone(store.getAll() as IDBRequest<VaultRecord[]>);
-    return all.filter((v) => v.conversationId === conversationId);
+    // Union: openChannel sorts by storedAtMs, and memory records carry the same field from seal().
+    return [...disk, ...[...this.mem.values()].filter((v) => v.conversationId === conversationId)];
+  }
+
+  /** Destroy every message record on DISK for this device (crypto-erase: the wrapped per-message keys
+   * go with them). Used when history-off is switched on, so turning it on does not leave the past
+   * sitting there. Memory-held records are untouched, so the open conversation survives the switch. */
+  async purgeDurable(): Promise<void> {
+    const store = this.db.transaction(STORE_MESSAGES, 'readwrite').objectStore(STORE_MESSAGES);
+    await reqDone(store.clear());
   }
 }
 
@@ -159,23 +233,58 @@ export interface ChannelRecord {
 }
 
 export class ChannelStore {
+  private ephemeral = false;
+  private readonly mem = new Map<string, ChannelRecord>();
+
   constructor(private readonly db: IDBDatabase) {}
 
+  /** History-off mode. The summary carries no message text (only the peer short-name and a constant
+   * preview), but it is still evidence a conversation happened, and dropping it entirely would make
+   * openChannel report the conversation as insecure and render the compose box read-only. */
+  setEphemeral(on: boolean): void {
+    this.ephemeral = on;
+    if (!on) {
+      this.mem.clear();
+    }
+  }
+
   async put(record: ChannelRecord): Promise<void> {
+    if (this.ephemeral || this.mem.has(record.id)) {
+      this.mem.set(record.id, record);
+      return;
+    }
     const store = this.db.transaction(STORE_CHANNELS, 'readwrite').objectStore(STORE_CHANNELS);
     await reqDone(store.put(record));
   }
-  get(id: string): Promise<ChannelRecord | undefined> {
+  async get(id: string): Promise<ChannelRecord | undefined> {
+    const held = this.mem.get(id);
+    if (held !== undefined) {
+      return held;
+    }
     const store = this.db.transaction(STORE_CHANNELS, 'readonly').objectStore(STORE_CHANNELS);
     return reqDone(store.get(id) as IDBRequest<ChannelRecord | undefined>);
   }
-  list(): Promise<readonly ChannelRecord[]> {
+  async list(): Promise<readonly ChannelRecord[]> {
     const store = this.db.transaction(STORE_CHANNELS, 'readonly').objectStore(STORE_CHANNELS);
-    return reqDone(store.getAll() as IDBRequest<ChannelRecord[]>);
+    const disk = await reqDone(store.getAll() as IDBRequest<ChannelRecord[]>);
+    if (this.mem.size === 0) {
+      return disk;
+    }
+    const byId = new Map(disk.map((r) => [r.id, r]));
+    for (const [id, r] of this.mem) {
+      byId.set(id, r);
+    }
+    return [...byId.values()];
   }
   async delete(id: string): Promise<void> {
+    this.mem.delete(id);
     const store = this.db.transaction(STORE_CHANNELS, 'readwrite').objectStore(STORE_CHANNELS);
     await reqDone(store.delete(id));
+  }
+  /** Drop every conversation row on disk (used when history-off is switched on). */
+  async purgeDurable(): Promise<void> {
+    const store = this.db.transaction(STORE_CHANNELS, 'readwrite').objectStore(STORE_CHANNELS);
+    await reqDone(store.clear());
   }
 }
 

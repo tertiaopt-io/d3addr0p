@@ -33,6 +33,7 @@ mod atrest;
 mod authz;
 mod conversation;
 mod provision;
+mod revoke;
 
 #[derive(Serialize)]
 struct Identity {
@@ -58,7 +59,7 @@ pub fn generate_identity(label: &str) -> Result<String, JsError> {
 fn generate_identity_inner(label: &str) -> Result<Identity, String> {
     let provider = OpenMlsRustCrypto::default();
     let (signer, credential_with_key) = new_identity(label)?;
-    let kp_bytes = fresh_key_package_bytes(&provider, &signer, credential_with_key)?;
+    let kp_bytes = fresh_key_package_bytes(&provider, &signer, credential_with_key, false)?;
     Ok(Identity {
         signature_public_key_hex: hex(signer.public()),
         key_package_b64: b64(&kp_bytes),
@@ -101,12 +102,31 @@ pub(crate) fn new_identity_authorized(
 
 /// Build a KeyPackage and store its private material in `provider`. Returns the serialized
 /// public KeyPackage that a peer uses to add this identity to a conversation.
+///
+/// `last_resort` marks the package with the MLS LastResort extension. This MUST be set for the
+/// package the directory serves repeatedly (UserStore keeps exactly one `is_last_resort = 1` row and
+/// re-serves it forever, with no `consumed_at` filter): without the extension OpenMLS DELETES the
+/// private bundle after the first successful Welcome, so the second claim of that same row yields a
+/// Welcome the recipient cannot open (`NoMatchingKeyPackage`) — silently, and with no crash or race
+/// required. One-time packages stay unmarked so they are correctly consumed on first use.
 pub(crate) fn fresh_key_package_bytes(
     provider: &OpenMlsRustCrypto,
     signer: &SignatureKeyPair,
     credential_with_key: CredentialWithKey,
+    last_resort: bool,
 ) -> Result<Vec<u8>, String> {
-    let bundle = KeyPackage::builder()
+    let builder = KeyPackage::builder();
+    // A leaf node must DECLARE every extension its key package carries, or validation at the adder
+    // rejects it with UnsupportedExtension. Only the last-resort package declares LastResort, so the
+    // one-time packages keep the default (empty) capability set.
+    let builder = if last_resort {
+        builder
+            .mark_as_last_resort()
+            .leaf_node_capabilities(Capabilities::new(None, None, Some(&[ExtensionType::LastResort]), None, None))
+    } else {
+        builder
+    };
+    let bundle = builder
         .build(CIPHERSUITE, provider, signer, credential_with_key)
         .map_err(|e| format!("key package build: {e:?}"))?;
     bundle
@@ -157,7 +177,7 @@ mod tests {
         let (bob_signer, bob_cwk) = new_identity("bob").unwrap();
 
         // Bob publishes a KeyPackage; private material is stored in Bob's provider.
-        let bob_kp_bytes = fresh_key_package_bytes(&bob_p, &bob_signer, bob_cwk).unwrap();
+        let bob_kp_bytes = fresh_key_package_bytes(&bob_p, &bob_signer, bob_cwk, false).unwrap();
         let bob_kp_in = KeyPackageIn::tls_deserialize_exact(&bob_kp_bytes).unwrap();
         let bob_kp = bob_kp_in
             .validate(alice_p.crypto(), ProtocolVersion::Mls10)

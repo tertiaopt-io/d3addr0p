@@ -15,6 +15,7 @@ import init, {
   deriveMasterKey,
   Conversation,
   sasDigestHex,
+  contactIdentDigestHex,
   provisionEphemeralKeypair,
   provisionSealToPub,
   provisionOpenToPriv,
@@ -51,6 +52,8 @@ const ready = (async () => {
     restoreConversation: (msk, sealed) => Conversation.fromSealed(msk, sealed),
     // The 66-bit device-provisioning SAS digest, bound to the full transcript (wasm free function).
     sasDigestHex: (nonceHex, accountPubHex, deviceKeyHex, certEpoch) => sasDigestHex(nonceHex, accountPubHex, deviceKeyHex, certEpoch),
+    // The contact identity digest for ONE account key, for the per-side Verify Buddy phrases.
+    contactIdentDigestHex: (aakHex) => contactIdentDigestHex(aakHex),
     // QR-pairing box (wasm free functions): ephemeral X25519 keypair, seal a grant to a public key,
     // open a sealed grant with a secret. Used by add-a-device-by-QR.
     provisionEphemeralKeypair: () => provisionEphemeralKeypair(),
@@ -70,12 +73,18 @@ const ready = (async () => {
 
 const OPS = {
   ping: () => Promise.resolve(true),
+  // The v2 auth secret's Argon2id, run HERE rather than on the main thread. It is a synchronous
+  // ~64 MiB grind; on the main thread it froze the sign-in screen and needed a second wasm module
+  // beside this one. Nothing else runs during sign-in, so the single-writer queue below costs
+  // nothing here. This derives a key from a passphrase and salt and nothing else: it touches no
+  // store and needs no unlocked vault (auth.ts hashes the result again before it leaves the device).
+  deriveAuthKey: (a) => Promise.resolve(deriveMasterKey(a[0], a[1])),
   unlock: (a) => controller.unlock(a[0], a[1]),
   verifyPassphrase: (a) => controller.verifyPassphrase(a[0], a[1]),
   deviceAuthState: () => controller.deviceAuthState(),
   discardAccount: (a) => controller.discardAccount(a[0]),
   listChannels: () => controller.listChannels(),
-  peerFor: (id) => controller.peerFor(id),
+  peerFor: (a) => controller.peerFor(a[0]), // the OPS table always receives the ARGS ARRAY
   openChannel: (a) => controller.openChannel(a[0]),
   openNoteToSelf: () => controller.openNoteToSelf(),
   startKeyExchange: () => controller.startKeyExchange(),
@@ -98,7 +107,18 @@ const OPS = {
   recoverWithSeed: (a) => controller.recoverWithSeed(a[0], a[1]),
   syncEpoch: (a) => controller.syncEpoch(a[0]),
   certEpoch: () => controller.certEpoch(),
+  // ADR-022 P7 revocation records (the device denylist).
+  revokeDeviceKey: (a) => controller.revokeDeviceKey(a[0], a[1]),
+  ingestRevocations: (a) => controller.ingestRevocations(a[0]),
+  revocationState: () => controller.revocationState(),
+  isDeviceRevoked: (a) => controller.isDeviceRevoked(a[0]),
   accountFingerprint: () => controller.accountFingerprint(),
+  historyOffEnabled: () => controller.historyOffEnabled(),
+  setHistoryOff: (a) => controller.setHistoryOff(a[0], a[1]),
+  buddyVerifyInfo: (a) => controller.buddyVerifyInfo(a[0]),
+  buddyVerifyStates: (a) => controller.buddyVerifyStates(a[0]),
+  markBuddyVerified: (a) => controller.markBuddyVerified(a[0], a[1], a[2]),
+  clearBuddyVerified: (a) => controller.clearBuddyVerified(a[0]),
   addDevice: (a) => controller.addDevice(a[0], a[1]),
   excludeDevice: (a) => controller.excludeDevice(a[0]),
   // Self-heal (H1): admit this account's authorized devices not yet in the open conversation. The app

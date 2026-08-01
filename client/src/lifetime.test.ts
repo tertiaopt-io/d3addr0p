@@ -228,6 +228,33 @@ describe('LifetimeManager (M2)', () => {
     expect(hooks.erased).toEqual([{ id: 'mhold', reason: 'duration' }]);
   });
 
+  it('armOnView reads NOTHING when the caller hands it a record that needs no arming', async () => {
+    // openChannel already holds every record it lists, and it runs on every send and every inbound
+    // message, so re-fetching each one was a fresh IndexedDB transaction per message for a value in
+    // memory. The caller's copy decides whether any write is needed; only a real write re-reads.
+    const msk = await freshMsk();
+    await mgr.storeIncoming(
+      msk,
+      { messageId: 'mknown', conversationId: 'c', direction: 'out', lifetime: { kind: 'duration', seconds: 30 } },
+      enc.encode('sent'),
+      true, // armed at store time
+    );
+    const armedRecord = await store.get('mknown');
+    expect(armedRecord).toBeDefined();
+    let reads = 0;
+    const realGet = store.get.bind(store);
+    store.get = async (id: string) => {
+      reads += 1;
+      return realGet(id);
+    };
+    await mgr.armOnView('mknown', armedRecord);
+    expect(reads).toBe(0); // the fast path did no I/O at all
+    await mgr.armOnView('mknown'); // without the record it still behaves exactly as before
+    expect(reads).toBe(1);
+    store.get = realGet;
+    expect((await store.get('mknown'))?.expiresAtMs).toBe(30_000); // and nothing was re-armed
+  });
+
   it('armOnView is a no-op for an already-armed message (idempotent re-view)', async () => {
     const msk = await freshMsk();
     await mgr.storeIncoming(

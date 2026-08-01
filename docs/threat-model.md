@@ -27,10 +27,10 @@ Instead we commit to, and test against, this set:
 | ID | Property | Mechanism (target) | Honest limit |
 |----|----------|--------------------|--------------|
 | P1 | Content security: confidentiality + integrity, forward secrecy, post-compromise security | MLS / TreeKEM (RFC 9420) for both 1:1 and groups; classical X25519 ciphersuite (PQ-hybrid pending, see P-note) | Cannot protect content on an implanted or compelled-unlocked endpoint; **no PQ yet** so wire captures are not harvest-now-decrypt-later safe |
-| P2 | Metadata resistance: who-talks-to-whom, when, how much is hidden from server and in-country network | Sealed sender, fixed-size padding, no stored graph, traffic shaping | SNI exposes destination domain; single origin enumerates the user set |
+| P2 | Metadata resistance: who-talks-to-whom, when, how much is hidden from server and in-country network | Per-epoch rotating mailboxes, fixed-size padding, no stored contact graph | SNI exposes destination domain; single origin enumerates the user set; no traffic shaping beyond payload padding |
 | P3 | Endpoint risk minimization (web-only) | No plaintext at rest (IndexedDB crypto-erase), no plaintext in browser caches, excluded from browser sync | A seized-unlocked or implanted device is not protected, only bounded; the browser/OS are the trusted base |
-| P4 | Coercion resistance | Duress passphrase, decoy mode, panic wipe | **No deniable authentication** (accepted, ADR-006): MLS signs messages with the sender's key, which can serve as transferable proof of authorship. Plus: a user can still be physically coerced |
-| P5 | Unobservability / censorship resistance | Innocuous rotating domain, decoy site, common-stack TLS fingerprint, traffic shaping | "Hard to detect" is not "undetectable"; destination domain is visible |
+| P4 | Coercion resistance | Self Destruct (crypto-erase the vault key), per-message lifetimes, device revocation | **NOT BUILT: no duress passphrase and no decoy mode** in this build, so a forced unlock opens the real account. Plus **no deniable authentication** (accepted, ADR-006): MLS signs messages with the sender's key, which can serve as transferable proof of authorship |
+| P5 | Unobservability / censorship resistance | Fixed-size payload padding, common-stack TLS fingerprint | **NOT BUILT: no rotating domain, no decoy site, no Tor mode.** The destination domain is visible and the landing page describes the product plainly, so this property is currently aspirational, not delivered |
 | P6 | Untrusted server | Ciphertext only, sealed sender, no PII, no persistence, no logs | A powered-on seized server may yield in-flight ciphertext from RAM (still opaque) |
 | P7 | Forensic unrecoverability | Permanent ciphertext opacity (incl. PQ), crypto-erase (destroy keys, not bytes) | Does not cover implanted / unlocked-seized / screenshotted / photographed endpoints |
 
@@ -89,16 +89,28 @@ exclusion) do not apply; their web equivalents do:
 - **No deniable authentication** (ADR-006, accepted). DEAD DROP does not provide the
   "cannot be cryptographically proven to have authored this" property. Coercion resistance
   rests on the controls below, not on deniability.
-- Duress passphrase opening a decoy account or triggering silent wipe.
-- Decoy / hidden mode; panic wipe. **Built at M4.**
+- Duress passphrase opening a decoy account or triggering silent wipe. **NOT BUILT.**
+- Decoy / hidden mode. **NOT BUILT.** (An earlier revision of this file claimed "Built at M4";
+  that was wrong and is corrected here. Nothing in the client implements either control.)
+- Self Destruct: destroys the wrapped master key, which crypto-erases everything stored on the
+  device. **Built** (DEAD DROP menu), and it is the only coercion control that exists today.
 
 ### P5 Unobservability / reachability (§5.3)
-- Self-hosted innocuous domain that rotates on a non-predictable schedule.
-- Probe-resistant decoy site (= the cover production's promo site, §A.7).
-- Common-stack TLS + server fingerprint (uTLS-style client JA3/JA4).
-- Disposable rotating front, never the operator's origin IP.
-- Rotation-distribution channel the adversary cannot subscribe to or predict (the crux).
-- Traffic shaping (fixed buckets, smoothed timing). **Built at M3. Decision: Gate 5 (owner-set), Gate 13.**
+This property is the least delivered of the seven. What is built:
+- Fixed-size payload padding (512 / 4K / 32K / 256K buckets, applied before encryption, covering
+  messages, revokes, and control frames). **Built at M3** (client/src/session.ts padToBucket).
+
+What is NOT built, and should not be claimed anywhere until it is:
+- Self-hosted innocuous domain that rotates on a non-predictable schedule. **NOT BUILT** (one
+  fixed domain, d3addr0p.com).
+- Probe-resistant decoy site. **NOT BUILT.** The landing page describes the product openly and
+  links its public source, which is a deliberate choice for verifiability and the opposite of cover.
+- Common-stack TLS / client fingerprint control (uTLS-style JA3/JA4). **NOT BUILT** (the browser
+  and the Cloudflare edge decide the fingerprint).
+- Disposable rotating front, never the operator's origin IP. **NOT BUILT.**
+- Rotation-distribution channel the adversary cannot subscribe to or predict (the crux). **NOT BUILT.**
+- Smoothed timing / cover traffic. **NOT BUILT** (only length is hidden, not timing or volume).
+- Built-in Tor mode. **NOT BUILT.** A user who needs it routes their own system through Tor.
 
 ### P6 Untrusted server (§5.9)
 - Ciphertext only, sealed sender, no PII, no graph, no persistence beyond in-memory TTL, no logs.

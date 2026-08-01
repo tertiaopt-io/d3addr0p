@@ -10,6 +10,8 @@ import type {
   AppController,
   BlockedContact,
   Buddy,
+  BuddyVerifyInfo,
+  BuddyVerifyBadge,
   GroupSummary,
   ChannelSummary,
   IdentityProfile,
@@ -104,6 +106,13 @@ export class WorkerController implements AppController {
     return this.call('ping', []);
   }
 
+  /** Run the memory-hard KDF for the v2 auth secret in the worker, so the ~64 MiB Argon2id grind
+   * never blocks the sign-in screen (see boot.js wireStrongKdf). Derivation only: no store is read
+   * or written, and the caller hashes the result under its own tag before sending it anywhere. */
+  deriveAuthKey(passphrase: string, salt: Uint8Array): Promise<Uint8Array> {
+    return this.call('deriveAuthKey', [passphrase, salt]);
+  }
+
   unlock(username: string, passphrase: string): Promise<{ ok: boolean; created?: boolean; error?: string }> {
     return this.call('unlock', [username, passphrase]);
   }
@@ -189,8 +198,48 @@ export class WorkerController implements AppController {
   certEpoch(): Promise<number> {
     return this.call('certEpoch', []);
   }
+  /** ADR-022 P7: mint the signed revocation record that excludes a device by NAME. Null when this
+   * device holds no account key (only a seed-holder can sign one). */
+  revokeDeviceKey(deviceSigKeyHex: string, issuedSeq: number): Promise<string | null> {
+    return this.call('revokeDeviceKey', [deviceSigKeyHex, issuedSeq]);
+  }
+  /** ADR-022 P7: accept records fetched from the control plane; returns how many were new. Each is
+   * signature-checked against our own account key inside the worker, so these arrive untrusted. */
+  ingestRevocations(records: readonly string[]): Promise<number> {
+    return this.call('ingestRevocations', [records]);
+  }
+  revocationState(): Promise<{ revoked: number; floor: number }> {
+    return this.call('revocationState', []);
+  }
+  isDeviceRevoked(deviceSigKeyHex: string): Promise<boolean> {
+    return this.call('isDeviceRevoked', [deviceSigKeyHex]);
+  }
   accountFingerprint(): Promise<string> {
     return this.call('accountFingerprint', []);
+  }
+
+  historyOffEnabled(): Promise<boolean> {
+    return this.call('historyOffEnabled', []);
+  }
+
+  setHistoryOff(on: boolean, purgeExisting = true): Promise<void> {
+    return this.call('setHistoryOff', [on, purgeExisting]);
+  }
+
+  buddyVerifyInfo(username: string): Promise<BuddyVerifyInfo> {
+    return this.call('buddyVerifyInfo', [username]);
+  }
+
+  buddyVerifyStates(usernames: readonly string[]): Promise<Record<string, BuddyVerifyBadge>> {
+    return this.call('buddyVerifyStates', [usernames]);
+  }
+
+  markBuddyVerified(username: string, peerKey: string, expectedPrev = ''): Promise<boolean> {
+    return this.call('markBuddyVerified', [username, peerKey, expectedPrev]);
+  }
+
+  clearBuddyVerified(username: string): Promise<void> {
+    return this.call('clearBuddyVerified', [username]);
   }
   addDevice(conversationId: string, target: DeviceTarget): Promise<void> {
     return this.call('addDevice', [conversationId, target]);

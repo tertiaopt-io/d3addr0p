@@ -48,8 +48,11 @@ export interface TransmitModel {
   readonly compose: string;
   readonly conversationId: string | null; // the live conversation this view drives, when any
   readonly selfNote?: boolean; // the Note to Self view (own-devices self-group): hide peer-only controls
+  // Self-group split diagnostic shown beside the group id: "<n> devices · W<seen>/<joined> · <error>".
+  readonly selfDiag?: string;
   readonly peerHandle?: string | null; // the buddy handle this conversation was tagged with, when known
   readonly peerIsBuddy?: boolean; // whether that handle is already on the buddy list (hides Add Buddy)
+  readonly verifyState?: BuddyVerifyInfo['state']; // contact verification for this conversation's peer
 }
 
 const HTML_ESCAPES: Record<string, string> = {
@@ -836,8 +839,21 @@ export function renderTransmit(m: TransmitModel): string {
   // (that would turn it into a mixed group and leak the buddy list on the next sync). Just a quiet
   // subtitle. A peer conversation keeps the name + key line here; the actions live in the bottom
   // toolbar (renderImToolbar), AIM-style.
+  // DIAGNOSTIC (self-group split): show WHICH own-devices group this window is using. Notes stopped
+  // crossing between devices and the deciding question — one shared group with broken delivery, or two
+  // separate groups — is answerable only from device-local MLS state, which the keyless gateway cannot
+  // show and Chrome/iOS has no console to print. Putting the id on screen makes it comparable by eye:
+  // SAME id on both devices means one group (a delivery problem), DIFFERENT ids means they are split
+  // (a formation/selection problem). The group id is not a secret (the server routes on its mailbox).
+  // The id alone cannot say WHICH device minted the group; roster size can (a populated self-group
+  // lists both devices, a solo one lists a single device), and the W<seen>/<joined> counters say what
+  // an arriving Welcome actually did. Compare the whole line across devices by eye.
+  const selfTag = (m.conversationId ?? '').replace(/^c-/, '').slice(0, 8);
+  const selfDiag = (m.selfDiag ?? '').trim();
   const sub = m.selfNote === true
-    ? `<div class="dd-sub"><span>${escapeHtml(m.peer ?? 'Note to Self')}</span><span>only your devices see this</span></div>`
+    ? `<div class="dd-sub"><span>${escapeHtml(m.peer ?? 'Note to Self')}</span><span>only your devices see this${
+        selfTag !== '' ? ` &middot; group ${escapeHtml(selfTag)}` : ''
+      }${selfDiag !== '' ? ` &middot; ${escapeHtml(selfDiag)}` : ''}</span></div>`
     : m.peer !== null
       ? `<div class="dd-sub"><span>${escapeHtml(m.peer)}</span><span>${
           m.fingerprint !== null ? `key ${escapeHtml(m.fingerprint)} &middot; verified` : 'unverified'
@@ -1092,6 +1108,31 @@ export const DEFAULT_IDENTITY: IdentityProfile = {
 /** A peer's cached identity for the Get-Info panel: their buddy icon and profile, keyed by their
  * device signature key and shown with the key fingerprint, which is the real trust anchor (the
  * profile is peer-authored and does not prove identity). */
+/** What the Verify Buddy panel renders.
+ *
+ * Two phrases, never one. Each side's words come from that side's OWN account key, so both people
+ * read both halves to each other. A single phrase over both keys was the first design and it was
+ * broken: the attacker picks the key he shows to each side, so he needs only a collision between two
+ * sets he generates himself, not a preimage on a fixed target.
+ *
+ * `state`: 'none' = both halves readable, never verified; 'verified' = pinned and the current key
+ * still matches; 'changed' = pinned and the current key positively DIFFERS (loud); 'stale' = pinned
+ * but the current key cannot be read right now, so nothing can be checked and nothing is claimed;
+ * 'unavailable' = nothing to compare at all (no conversation with them, no live session, older wasm). */
+/** The buddy-list verification badge. 'stale' exists so a pin the app cannot currently check never
+ * renders as a confident green check. */
+export type BuddyVerifyBadge = 'verified' | 'changed' | 'stale';
+
+export interface BuddyVerifyInfo {
+  peerKey: string;
+  peerFingerprint: string;
+  ourFingerprint: string;
+  ourWords: string; // OUR account's phrase, which we read to them
+  theirWords: string; // the phrase for the key we currently see for them, which they read to us
+  verifiedKey: string;
+  state: 'none' | 'verified' | 'changed' | 'stale' | 'unavailable';
+}
+
 export interface PeerIdentity {
   readonly key: string;
   readonly fingerprint: string;
@@ -1221,6 +1262,8 @@ export type AppView =
       readonly devices: readonly DeviceInfo[];
       readonly currentDeviceKey: string;
       readonly pending?: string; // a deviceId awaiting an inline revoke confirmation
+      readonly historyOff?: boolean; // this device holds messages in memory only
+      readonly historyArm?: boolean; // turning history-off ON is armed (it erases what is stored)
       readonly error?: string;
     }
   | {
@@ -1245,6 +1288,8 @@ export type AppView =
       readonly presence?: string; // opt-in server status shown when opened by username from the buddy list
       readonly away?: string; // opt-in server away text shown when opened by username from the buddy list
       readonly self?: boolean; // Buddy Info on YOURSELF: your own card, no peer trust warning
+      readonly verify?: BuddyVerifyInfo; // the Verify Buddy panel (only when opened by username)
+      readonly verifyArm?: boolean; // re-verify after a key change is armed (two-tap)
     }
   | {
       readonly kind: 'buddies';
@@ -1258,6 +1303,7 @@ export type AppView =
       readonly ownName: string; // our handle, shown in the header (AIM-style)
       readonly icons: Record<string, BuddyIcon>; // cached buddy icons by username (absent = placeholder)
       readonly awayText: Record<string, string>; // cached E2E away messages by username (the dim subtitle while away)
+      readonly verify?: Record<string, BuddyVerifyBadge>; // per-buddy verification badge (pinned keys only)
       readonly error?: string;
       readonly signals?: Record<string, 'on' | 'off'>; // one-shot sign-on/off flash for rows that just changed
     }
@@ -1351,9 +1397,35 @@ export interface AppController {
   syncEpoch?(epoch: number): Promise<{ ready: boolean; stale: boolean }>;
   /** This device's own certificate epoch (0 if unauthorized). */
   certEpoch?(): Promise<number>;
+  /** ADR-022 P7: mint the signed revocation record that excludes a device by NAME, returned as hex to
+   * publish. Null when this device holds no account key. The epoch above is only a lower bound and
+   * cannot exclude a device that still holds the account seed; this is what does. */
+  revokeDeviceKey?(deviceSigKeyHex: string, issuedSeq: number): Promise<string | null>;
+  /** ADR-022 P7: accept revocation records fetched from the control plane, returning how many were new.
+   * Each is verified against our own account key inside the worker, so these arrive untrusted. */
+  ingestRevocations?(records: readonly string[]): Promise<number>;
+  /** The record count (the derived epoch) and this device's certification floor, for diagnostics. */
+  revocationState?(): Promise<{ revoked: number; floor: number }>;
+  /** Whether we hold a verifying revocation record for this device key. */
+  isDeviceRevoked?(deviceSigKeyHex: string): Promise<boolean>;
   /** A short fingerprint of this account's authorization key (stable across the user's devices), for the
    * shareable contact QR. Empty when unauthorized/legacy. */
   accountFingerprint?(): Promise<string>;
+  /** Whether this device is holding messages in memory only (history-off / ephemeral mode). */
+  historyOffEnabled?(): Promise<boolean>;
+  /** Turn history-off on or off. Turning it ON crypto-erases the message history already on this
+   * device, so the setting is not a promise the device fails to keep. */
+  setHistoryOff?(on: boolean, purgeExisting?: boolean): Promise<void>;
+  /** Everything the Verify Buddy panel shows for one buddy (phrase, keys, pinned state). */
+  buddyVerifyInfo?(username: string): Promise<BuddyVerifyInfo>;
+  /** The per-buddy verification badge for the list: present only for buddies with a pinned key. */
+  buddyVerifyStates?(usernames: readonly string[]): Promise<Record<string, BuddyVerifyBadge>>;
+  /** Pin `peerKey` after the user compared BOTH phrases. `expectedPrev` is the pin the panel was
+   * rendered against (empty for a first verification); a mismatch means the screen is stale and the
+   * call refuses. False = nothing was pinned, re-open and compare again. */
+  markBuddyVerified?(username: string, peerKey: string, expectedPrev?: string): Promise<boolean>;
+  /** Drop a buddy's pinned verification. */
+  clearBuddyVerified?(username: string): Promise<void>;
   /** P5: add an already-enrolled device to one conversation. */
   addDevice?(conversationId: string, target: DeviceTarget): Promise<void>;
   /** P6: exclude a device from the open group (forward-secure exclusion); the MLS half of revoke. */
@@ -1454,10 +1526,23 @@ function renderLogoHero(): string {
   );
 }
 
-function renderMenubar(minimized: readonly { readonly key: string; readonly title: string }[] = []): string {
-  // Minimized windows live on the menu bar as chips (the AIM taskbar); clicking one restores it.
+function renderMenubar(
+  minimized: readonly { readonly key: string; readonly title: string; readonly unread?: number }[] = [],
+): string {
+  // Minimized windows live on the menu bar as chips (the AIM taskbar); clicking one restores it. A chip
+  // with unread arrivals carries a count and an attention class, so a docked conversation never swallows
+  // a message silently (the AIM taskbar flashed for exactly this).
   const chips = minimized
-    .map((m) => `<button type="button" class="dd-menu-chip" data-restore="${escapeHtml(m.key)}" title="restore ${escapeHtml(m.title)}">▪ ${escapeHtml(m.title)}</button>`)
+    .map((m) => {
+      const n = m.unread ?? 0;
+      const cls = n > 0 ? 'dd-menu-chip dd-menu-chip-unread' : 'dd-menu-chip';
+      const badge = n > 0 ? `<span class="dd-chip-badge">${n > 99 ? '99+' : String(n)}</span>` : '';
+      const label = n > 0 ? `restore ${m.title} (${String(n)} unread)` : `restore ${m.title}`;
+      return (
+        `<button type="button" class="${cls}" data-restore="${escapeHtml(m.key)}" title="${escapeHtml(label)}">` +
+        `▪ ${escapeHtml(m.title)}${badge}</button>`
+      );
+    })
     .join('');
   // The brand is the app icon + name and opens the DEAD DROP menu (Device keys + Self Destruct). The same
   // menu also lives in the buddy-list titlebar corner; both share the app-menu wiring. Buddies/Channels
@@ -1586,8 +1671,13 @@ function renderPitch(): string {
  * things that protect most people most of the time; this states the real design trades without
  * overclaiming. Web only. Copy rules: no em-dashes, no "not X but Y". */
 function renderComparison(): string {
+  // data-col carries the column name so a phone can stack each row into labelled blocks (the header
+  // row is hidden there, and CSS reads the label back with content: attr(data-col)). A three-column
+  // table cannot fit 375px without either side-scrolling or clipping; see the media query in chrome.css.
   const row = (feature: string, dd: string, sig: string): string =>
-    `<tr><th scope="row">${escapeHtml(feature)}</th><td>${escapeHtml(dd)}</td><td>${escapeHtml(sig)}</td></tr>`;
+    `<tr><th scope="row">${escapeHtml(feature)}</th>` +
+    `<td data-col="DEAD DROP">${escapeHtml(dd)}</td>` +
+    `<td data-col="Signal">${escapeHtml(sig)}</td></tr>`;
   return (
     '<div class="dd-compare">' +
     '<div class="dd-compare-title">How the two are built</div>' +
@@ -1633,7 +1723,7 @@ function renderComparison(): string {
     row('Who runs the server', 'You can. It is one small self-hosted service.', 'Signal runs it for everyone.') +
     row(
       'Confirming a contact',
-      'Not yet. The first key exchange is taken on trust, so a seized server could substitute a key.',
+      'A six word phrase per buddy, compared in person or over a call, pinned to their account key. First contact is still taken on trust until you compare.',
       'Safety numbers you compare in person or over a channel you already trust.',
     ) +
     row('Independent audit', 'None. This is a young project.', 'Audited, and the protocol is widely reviewed.') +
@@ -1642,12 +1732,12 @@ function renderComparison(): string {
     'the sealed sender, the recovery path, and the crowd, and for almost everyone it is the right ' +
     'answer. This project is for people who want an account with no phone number, a server they ' +
     'control, message lifetimes decided one message at a time, and a client that stays on the desk, ' +
-    'and who accept a young unaudited build with no contact verification in exchange.</div>' +
+    'and who accept a young unaudited build in exchange.</div>' +
     '</div>'
   );
 }
 
-/** Desktop builds, below the comparison. Web only, for the same reason. */
+/** Desktop builds, above the comparison. Web only, for the same reason. */
 function renderDownloads(): string {
   return (
     '<div class="dd-downloads">' +
@@ -1708,8 +1798,10 @@ export function renderUnlock(error?: string, mode: 'login' | 'register' = 'login
     '<button class="dd-link" type="button" data-action="to-register">New here? Create an account</button>' +
     renderProjectAttribution() +
     // The comparison panel and the desktop downloads belong to the WEB landing page. Inside the native
-    // app they would be noise: you are already running the thing they advertise.
-    (isNativeShell() ? '' : renderPitch() + renderComparison() + renderDownloads()) +
+    // app they would be noise: you are already running the thing they advertise. Downloads come BEFORE
+    // the comparison: the app is the thing to act on, and the comparison is long enough on a phone to
+    // bury anything under it.
+    (isNativeShell() ? '' : renderPitch() + renderDownloads() + renderComparison()) +
     '</form>'
   );
 }
@@ -2170,7 +2262,7 @@ function renderBuddyListHeader(profile: IdentityProfile, ownName: string): strin
 /** One buddy as a plain NAME row in the read-only tree. It is a <button> only so it is keyboard-reachable;
  * it is styled as plain text, not a chunky button. Single-click SELECTS it (highlighted) for the bottom
  * toolbar; double-click opens a chat. */
-function renderTreeBuddyName(b: Buddy, status: string | undefined, selected: boolean, icon?: BuddyIcon, signal?: 'on' | 'off', awayText?: string): string {
+function renderTreeBuddyName(b: Buddy, status: string | undefined, selected: boolean, icon?: BuddyIcon, signal?: 'on' | 'off', awayText?: string, verify?: BuddyVerifyBadge): string {
   const off = isBuddyOnline(status) ? '' : ' dd-tree-buddy-off';
   const sel = selected ? ' dd-tree-sel' : '';
   // A one-shot sign-on/sign-off flash (AIM-style): the row plays a brief highlight the render right
@@ -2183,9 +2275,19 @@ function renderTreeBuddyName(b: Buddy, status: string | undefined, selected: boo
   // A generous char cap; the CSS (.dd-tree-sub, ellipsis) does the visual truncation to the row width.
   const preview = away && awayText !== undefined && awayText.length > 0 ? awayPreview(awayText, 90) : '';
   const sub = away ? `<span class="dd-tree-sub">${preview.length > 0 ? escapeHtml(preview) : 'Away'}</span>` : '';
+  // The verification badge: a quiet check for a pinned key, a loud warning when the key CHANGED under
+  // a pinned one. Only verified buddies carry either; everyone else stays unadorned (no alarm fatigue).
+  const badge = verify === 'verified'
+    ? '<span class="dd-tree-verify" title="verified">\u2713</span>'
+    : verify === 'changed'
+      ? '<span class="dd-tree-verify dd-tree-verify-bad" title="identity changed">!</span>'
+      : verify === 'stale'
+        // Pinned but not checkable right now: a hollow marker, deliberately NOT the confident check.
+        ? '<span class="dd-tree-verify dd-tree-verify-stale" title="verified earlier, cannot check right now">\u25cb</span>'
+        : '';
   const nameCol = sub.length > 0
-    ? `<span class="dd-tree-text"><span class="dd-tree-label">${escapeHtml(b.username)}</span>${sub}</span>`
-    : `<span class="dd-tree-label">${escapeHtml(b.username)}</span>`;
+    ? `<span class="dd-tree-text"><span class="dd-tree-label">${escapeHtml(b.username)}${badge}</span>${sub}</span>`
+    : `<span class="dd-tree-label">${escapeHtml(b.username)}${badge}</span>`;
   return (
     `<button type="button" class="dd-tree-buddy${off}${sel}${fx}${sub.length > 0 ? ' dd-tree-buddy-sub' : ''}" data-buddy-select="${escapeHtml(b.username)}" aria-pressed="${selected}">` +
     `<span class="dd-status-dot ${presenceDotClass(status)}"></span>` +
@@ -2268,6 +2370,7 @@ export function renderBuddies(
   awayText: Record<string, string> = {},
   error?: string,
   signals: Record<string, 'on' | 'off'> = {},
+  verify: Record<string, BuddyVerifyBadge> = {},
 ): string {
   const err = error !== undefined ? `<div class="dd-form-error">${escapeHtml(error)}</div>` : '';
   const collapsedSet = new Set(collapsed);
@@ -2289,7 +2392,7 @@ export function renderBuddies(
         return `<div class="dd-tree-node">${header}</div>`;
       }
       const kids = sortedMembers(members, statuses)
-        .map((b) => renderTreeBuddyName(b, statuses[b.username], selectedSet.has(b.username), icons[b.username], signals[b.username], awayText[b.username]))
+        .map((b) => renderTreeBuddyName(b, statuses[b.username], selectedSet.has(b.username), icons[b.username], signals[b.username], awayText[b.username], verify[b.username]))
         .join('');
       return `<div class="dd-tree-node">${header}<div class="dd-tree-kids">${kids}</div></div>`;
     })
@@ -2555,11 +2658,32 @@ function renderDeviceRow(d: DeviceInfo, currentDeviceKey: string, hasOtherAuthor
 }
 
 /** Settings → Devices screen: list the account's devices and revoke any that is not this one. */
+/** The history-off control. Turning it ON destroys what is already stored on this device, so it is a
+ * two-tap action: the first tap says exactly what will be lost, the second does it. */
+function renderHistoryToggle(on: boolean, armed: boolean): string {
+  const state = on
+    ? '<div class="dd-verify-title">Messages are not being saved</div>' +
+      '<div class="dd-form-note">This device keeps messages in memory only. They are gone when you sign ' +
+      'out, reload, or close the app, and nothing about them is written to disk. Your account, your ' +
+      'buddy list and your conversations themselves are still saved, so you stay reachable.</div>' +
+      '<div class="dd-field"><button class="dd-btn" data-action="history-on">Start saving messages again</button></div>'
+    : '<div class="dd-verify-title">Message history</div>' +
+      '<div class="dd-form-note">Messages you send and receive are saved on this device, encrypted under ' +
+      'your passphrase, until their lifetimes end. Turn that off to keep them in memory only for as long ' +
+      'as the app is open.</div>' +
+      `<div class="dd-field"><button class="dd-btn${armed ? ' dd-btn-danger' : ''}" data-action="history-off">${
+        armed ? 'Tap again: this erases the messages stored here' : 'Stop saving messages'
+      }</button></div>`;
+  return `<div class="dd-verify${on ? ' dd-verify-ok' : ''}">${state}</div>`;
+}
+
 export function renderSettings(
   devices: readonly DeviceInfo[],
   currentDeviceKey: string,
   pending?: string,
   error?: string,
+  historyOff?: boolean,
+  historyArm?: boolean,
 ): string {
   const err = error !== undefined ? `<div class="dd-form-error">${escapeHtml(error)}</div>` : '';
   // A centered Back button returns to the buddy list from either state (Device keys is reached from the
@@ -2592,7 +2716,9 @@ export function renderSettings(
     .filter((d) => !d.revoked)
     .map((d) => renderDeviceRow(d, currentDeviceKey, hasOtherAuthorized, pending))
     .join('');
+  const history = renderHistoryToggle(historyOff === true, historyArm === true);
   const actions =
+    history +
     '<div class="dd-field">' +
     '<button class="dd-btn dd-btn-primary" data-action="scan-device">Scan a device</button> ' +
     '<button class="dd-btn dd-btn-primary" data-action="show-device-qr">Show this device</button>' +
@@ -3345,7 +3471,72 @@ function downscaleImage(file: File): Promise<string | null> {
 /** Peer Get-Info panel (AIM "Get Info"): the contact's buddy icon and profile, kept de-emphasized
  * with the key fingerprint and the trust warning, because the profile is peer-authored and does not
  * prove identity. */
-export function renderGetInfo(peer: string, peers: readonly PeerIdentity[], presence?: string, away?: string, self?: boolean): string {
+/** The Verify Buddy panel: TWO phrases (one per side), the two account fingerprints, and the pinned
+ * state. Each phrase is derived from that side's own account key, so both people compare both halves;
+ * comparing them over a channel you already trust defeats a server that substituted a key at first
+ * contact (the honest-limits TOFU residual). */
+function renderVerifySection(peer: string, v: BuddyVerifyInfo, armed: boolean): string {
+  const title = (t: string): string => `<div class="dd-verify-title">${escapeHtml(t)}</div>`;
+  if (v.state === 'unavailable') {
+    return (
+      '<div class="dd-verify">' + title('Verify buddy') +
+      '<div class="dd-form-note">Nothing to compare yet. Open a conversation with this buddy first; ' +
+      'the words appear once their account key is visible here.</div></div>'
+    );
+  }
+  if (v.state === 'stale') {
+    // Pinned, but unreadable right now. Say exactly that. Never imply the key is being watched when
+    // it is not: a silent green check here was a real defect.
+    return (
+      '<div class="dd-verify dd-verify-stale">' + title('Verified, but not checkable right now') +
+      `<div class="dd-form-note">You verified ${escapeHtml(peer)} before, and that is still stored. ` +
+      'This device cannot read their current account key at the moment, so it cannot confirm the key ' +
+      'still matches. Open a one to one conversation with them to check again. Until then, treat this ' +
+      'channel as unconfirmed.</div>' +
+      '<div class="dd-field"><button class="dd-btn" data-action="verify-clear">Forget verification</button></div></div>'
+    );
+  }
+  // Both halves, always together: each side's words come from that side's own account key, so the two
+  // people read both halves to each other. One shared phrase would let a man in the middle pick both
+  // keys and search for a collision instead of a preimage.
+  const phrases =
+    '<div class="dd-verify-pair">' +
+    `<div class="dd-verify-half"><div class="dd-verify-label">your words, read these out</div><div class="dd-sas-words dd-verify-words">${escapeHtml(v.ourWords)}</div></div>` +
+    `<div class="dd-verify-half"><div class="dd-verify-label">their words, they read these to you</div><div class="dd-sas-words dd-verify-words">${escapeHtml(v.theirWords)}</div></div>` +
+    '</div>';
+  const fps = `<div class="dd-fp-label">you ${escapeHtml(v.ourFingerprint)} \u00b7 them ${escapeHtml(v.peerFingerprint)}</div>`;
+  if (v.state === 'changed') {
+    return (
+      '<div class="dd-verify dd-verify-changed">' + title('Identity changed') +
+      `<div class="dd-verify-warn">The account key is NOT the one you verified for ${escapeHtml(peer)}. ` +
+      'That can mean they rebuilt their account, or that someone is in the middle. Confirm with them ' +
+      'over a channel you already trust before saying anything private.</div>' +
+      phrases + fps +
+      `<div class="dd-field"><button class="dd-btn dd-btn-danger" data-action="verify-mark">${armed ? 'Tap again to trust the new key' : 'Verify the new key'}</button>` +
+      '<button class="dd-btn" data-action="verify-clear">Forget verification</button></div></div>'
+    );
+  }
+  if (v.state === 'verified') {
+    return (
+      '<div class="dd-verify dd-verify-ok">' + title('Verified buddy') +
+      '<div class="dd-form-note">You compared the words and pinned this key. While this device can ' +
+      'read their current key, a change is flagged here, in the buddy list, and in the conversation.</div>' +
+      phrases + fps +
+      '<div class="dd-field"><button class="dd-btn" data-action="verify-clear">Forget verification</button></div></div>'
+    );
+  }
+  return (
+    '<div class="dd-verify">' + title('Verify buddy') +
+    `<div class="dd-form-note">Call ${escapeHtml(peer)}, or stand next to them, and compare BOTH sets ` +
+    'of words. Read yours out; they should see the same words under "their words" on their screen. ' +
+    'Then have them read theirs, and check it against the second box here. Mark them verified only if ' +
+    'both halves match. If either half differs, the channel is not safe.</div>' +
+    phrases + fps +
+    '<div class="dd-field"><button class="dd-btn" data-action="verify-mark">Mark as Verified</button></div></div>'
+  );
+}
+
+export function renderGetInfo(peer: string, peers: readonly PeerIdentity[], presence?: string, away?: string, self?: boolean, verify?: BuddyVerifyInfo, verifyArm?: boolean): string {
   const cards =
     peers.length === 0
       ? '<div class="dd-form-sub">No buddy info yet. It appears after they connect and share it.</div>'
@@ -3369,6 +3560,7 @@ export function renderGetInfo(peer: string, peers: readonly PeerIdentity[], pres
     status +
     awayLine +
     cards +
+    (self !== true && verify !== undefined ? renderVerifySection(peer, verify, verifyArm === true) : '') +
     // Your OWN card needs no trust warning: you are signed in on this device, so this card is yours
     // by definition. A peer's card keeps the fingerprint-verification warning.
     (self === true
@@ -3712,7 +3904,7 @@ function renderWindowContent(view: AppView): string {
     return renderRevokeSelf(view.deviceId, view.error);
   }
   if (view.kind === 'settings') {
-    return renderSettings(view.devices, view.currentDeviceKey, view.pending, view.error);
+    return renderSettings(view.devices, view.currentDeviceKey, view.pending, view.error, view.historyOff, view.historyArm);
   }
   if (view.kind === 'identity') {
     return renderIdentity(view, profileContactLink);
@@ -3721,13 +3913,13 @@ function renderWindowContent(view: AppView): string {
     return renderAway(view);
   }
   if (view.kind === 'getinfo') {
-    return renderGetInfo(view.peer, view.peers, view.presence, view.away, view.self);
+    return renderGetInfo(view.peer, view.peers, view.presence, view.away, view.self, view.verify, view.verifyArm);
   }
   if (view.kind === 'appearance') {
     return renderAppearance(view.draft, view.category, view.error, view.packText);
   }
   if (view.kind === 'buddies') {
-    return renderBuddies(view.buddies, view.groups, view.statuses, view.collapsed, view.blocked, view.selected, view.profile, view.ownName, view.icons, view.awayText, view.error, view.signals ?? {});
+    return renderBuddies(view.buddies, view.groups, view.statuses, view.collapsed, view.blocked, view.selected, view.profile, view.ownName, view.icons, view.awayText, view.error, view.signals ?? {}, view.verify ?? {});
   }
   if (view.kind === 'buddysetup') {
     return renderBuddySetup(view.buddies, view.groups, view.statuses, view.blocked, view.presenceOn, view.notifyOn, view.selected, view.error);
@@ -3750,6 +3942,10 @@ export interface MinimizedWin {
   readonly key: string; // dedupe key: 'conv:<id>' for conversations, 'kind:<kind>' otherwise
   readonly title: string;
   readonly view: AppView;
+  // Unread arrivals while this window sat MINIMIZED (docked). AIM never silently swallowed a message: a
+  // docked conversation flashes its chip so the user knows something is waiting. Cleared on restore
+  // (restoring opens the conversation, which marks it seen and starts any burn countdown).
+  readonly unread?: number;
 }
 
 /** The stable identity of a window (one per conversation, one per other screen kind). Windows that share
@@ -4264,12 +4460,15 @@ export function mountApp(
     const poll = async (): Promise<void> => {
       const buddies = (await controller.listBuddies?.()) ?? [];
       let changed = false;
-      for (const b of buddies) {
-        // Skip our OWN entry: our status is driven locally (the ◆ control), not the presence server.
-        if (normalizeUsername(b.username) === normalizeUsername(currentUsername)) {
-          continue;
-        }
-        const status = await acct.getPresence(b.username);
+      // Skip our OWN entry: our status is driven locally (the ◆ control), not the presence server.
+      const watched = buddies.filter((b) => normalizeUsername(b.username) !== normalizeUsername(currentUsername));
+      // One request per buddy, ISSUED TOGETHER. Awaiting each in turn meant 50 buddies cost 50 serial
+      // round trips every 30 seconds, measured at 5.3s per cycle over a 100ms link and 10.2s over 200ms,
+      // where the same work in parallel took 1.0s and 2.1s. loadBuddyStatuses already fetches this same
+      // data with Promise.all; this is now consistent with it.
+      const statuses = await Promise.all(watched.map((b) => acct.getPresence(b.username)));
+      for (const [i, b] of watched.entries()) {
+        const status = statuses[i] ?? 'offline';
         const prev = buddyStatusPrev[b.username] ?? 'offline';
         const wasOnline = prev !== 'offline';
         const nowOnline = status !== 'offline';
@@ -4776,6 +4975,8 @@ export function mountApp(
   const chanDrafts = new Map<string, string>();
 
   let navGen = 0;
+  /** Guards doRegister against a concurrent second run (see doRegister for what that destroyed). */
+  let registerInFlight = false;
   // An explicit Back off the Settings (Device Keys) screen sets this synchronously, so the revoke
   // removal-heal cascade's background roster-changed refreshes cannot repaint Settings over the buddy list
   // (a navGen race: guard-less openSettings has fewer awaits than openBuddies and wins). Cleared only when
@@ -4902,6 +5103,11 @@ export function mountApp(
     if (view.kind === 'settings' && next.kind !== 'settings') {
       suppressSettingsRefresh = true; // leaving Settings: a background roster-changed refresh must not follow us back
     }
+    // Settings -> Settings is a REPAINT of a list the user is pointing at (the revoked row appearing after
+    // a revoke). Rebuilding resets the scroll container to the top, so the row under the cursor silently
+    // becomes a DIFFERENT device: the next click revokes the wrong one. Carry the offset across the
+    // rebuild. Only same-kind repaints, so a deliberate navigation still starts at the top.
+    const keepScroll = view.kind === 'settings' && next.kind === 'settings' ? settingsScrollTop() : null;
     const fastLog = isLogOnlyRefresh(next); // decide against the OUTGOING view, before any mutation below
     navGen++;
     stopScan(); // any navigation ends an in-progress camera scan and releases the camera
@@ -4996,7 +5202,54 @@ export function mountApp(
     } else {
       render();
     }
+    // A pending revoke confirm ANCHORS ON THE ROW ITSELF, not on a scroll offset. The offset restore
+    // below proved fragile here (with parked windows on the desktop there can be several .dd-form
+    // elements, and the first one is not necessarily the live list), and an offset is the wrong model
+    // anyway: inserting the confirm strip shifts the rows, so the same offset can put a DIFFERENT
+    // device under the pointer, and the user, mid-gesture, almost revokes it. block:'nearest' means a
+    // row that is already visible does not move at all; focus lands on the confirm button so the next
+    // tap or Enter lands on the SAME device the first click armed.
+    if (next.kind === 'settings' && next.pending !== undefined) {
+      const confirm = root.querySelector(`[data-action="revoke-confirm"][data-device="${cssEscape(next.pending)}"]`);
+      if (confirm instanceof HTMLElement) {
+        confirm.focus();
+        if (typeof confirm.scrollIntoView === 'function') {
+          confirm.scrollIntoView({ block: 'nearest' });
+        }
+      }
+    } else if (keepScroll !== null) {
+      restoreSettingsScroll(keepScroll); // put the list back where the user left it (see keepScroll above)
+    }
   };
+
+  /** The Device keys list scrolls inside the form; read/write its offset so a repaint does not move the
+   * rows out from under the pointer. Returns null when that container is not on screen. */
+  /** The LIVE window's scrolling form. With parked windows on the desktop several .dd-form elements
+   * can coexist and the live window paints LAST, so querySelector (the first match) read a parked
+   * snapshot's offset — always 0 — and the "restore" reset the real list to the top. */
+  function liveSettingsForm(): HTMLElement | null {
+    const forms = root.querySelectorAll('.dd-form');
+    const el = forms.length > 0 ? forms[forms.length - 1] : null;
+    return el instanceof HTMLElement ? el : null;
+  }
+
+  function settingsScrollTop(): number | null {
+    const el = liveSettingsForm();
+    return el !== null && el.scrollTop > 0 ? el.scrollTop : null;
+  }
+
+  function restoreSettingsScroll(top: number): void {
+    const el = liveSettingsForm();
+    if (el !== null) {
+      el.scrollTop = top;
+    }
+  }
+
+  /** CSS.escape with a fallback for environments without it (device ids are hex, so the escape is
+   * belt-and-suspenders; the fallback strips anything that could break out of the selector). */
+  function cssEscape(v: string): string {
+    return typeof CSS !== 'undefined' && typeof CSS.escape === 'function' ? CSS.escape(v) : v.replace(/[^a-zA-Z0-9_-]/g, '');
+  }
 
   // Whether the user asked the OS to reduce motion; animations are skipped (and their post-step runs
   // immediately) when true, matching the CSS `prefers-reduced-motion` rules.
@@ -5345,6 +5598,9 @@ export function mountApp(
   // strikes abort the heal poll for that device: every further tick would claim and burn one more of
   // its packages against a directory that can only serve rejected ones. Reset when a new heal arms.
   const siblingAddRejections = new Map<string, number>();
+  // The last rejection REASON per device key, so the abort toast can say what actually happened instead
+  // of leaving the only copy of it in a console line the user was never going to open.
+  const siblingAddRejectReasons = new Map<string, string>();
 
   function connDisplayLabel(): string {
     if (connState === 'connecting' && connAttempt > 0) {
@@ -5552,6 +5808,46 @@ export function mountApp(
       void reconcileSiblings();
       void ensureSelfGroup();
     }
+  }
+
+  // A mobile browser FREEZES a backgrounded tab and routinely kills the WebSocket while the phone is
+  // asleep. On wake the page still believes it is connected, its socket is dead, and nothing re-runs the
+  // self-group convergence, so a device that has not finished syncing sits stuck until a MANUAL reload.
+  // Requiring a force-reload on a phone is not acceptable, so on the tab becoming visible again (unlock /
+  // tab focus), the network returning, or a bfcache restore, force a fresh reconnect: connectLive
+  // supersedes the possibly-dead socket, re-subscribes every mailbox, re-publishes the contact graph into
+  // the self-group (the reconnect resync), and re-runs the self-group heal + reconcile. Throttled so a
+  // burst of focus/visibility events collapses to one reconnect, and skipped mid-pairing (a reconnect is
+  // preserved for a live QR machine, but a fresh cascade during the scan is needless churn).
+  const WAKE_RESYNC_MIN_MS = 4000;
+  let lastWakeSyncMs = 0;
+  function wakeResync(): void {
+    if (currentUsername === '' || opts?.wsUrl === undefined || view.kind === 'provisioning') {
+      return;
+    }
+    const now = Date.now();
+    if (now - lastWakeSyncMs < WAKE_RESYNC_MIN_MS) {
+      return; // throttle: rapid focus flapping collapses to a single reconnect
+    }
+    lastWakeSyncMs = now;
+    void reconnectNow();
+    // Repaint the buddy list if it is the open view, so freshly-adopted state shows without a manual
+    // navigation. The worker's buddies-updated event also drives this, but a wake with no change still
+    // wants the current view refreshed off any now-converged self-group.
+    if (view.kind === 'buddies') {
+      void openBuddies();
+    }
+  }
+  if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') {
+        wakeResync();
+      }
+    });
+  }
+  if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    window.addEventListener('online', () => wakeResync());
+    window.addEventListener('pageshow', () => wakeResync()); // bfcache restore (mobile back/forward)
   }
 
   function setConn(state: string): void {
@@ -6504,23 +6800,34 @@ export function mountApp(
           return;
         }
         // Another device: show the inline confirm strip for this row (no native confirm() that would leak).
-        go({ kind: 'settings', devices: view.devices, currentDeviceKey: view.currentDeviceKey, pending: el.dataset.device });
+        go({ ...view, pending: el.dataset.device });
       });
     });
     root.querySelector('[data-action="revoke-cancel"]')?.addEventListener('click', () => {
       if (view.kind === 'settings') {
-        go({ kind: 'settings', devices: view.devices, currentDeviceKey: view.currentDeviceKey });
+        const { pending: _cleared, ...rest } = view;
+        go(rest);
       }
     });
     // Confirm revoking ANOTHER device (the inline strip). Revoking THIS device goes through the dedicated
     // revokeself confirmation below.
     root.querySelectorAll('[data-action="revoke-confirm"]').forEach((el) => {
-      el.addEventListener('click', () => {
+      el.addEventListener('click', () => void (async () => {
         if (view.kind !== 'settings' || account === undefined || !(el instanceof HTMLElement) || el.dataset.device === undefined) {
           return;
         }
         const deviceId = el.dataset.device;
-        void account.revokeDevice(deviceId).then(async (result) => {
+        // ADR-022 P7: mint the SIGNED REVOCATION RECORD before asking the server to burn the row, and
+        // send it with the call. The server-side burn stops the device logging in; it does nothing about
+        // a device that already holds the account seed, which simply re-certifies itself at a higher
+        // epoch and is re-admitted to every group. Only a record naming its signature key excludes it,
+        // and only a seed-holder can sign one, so this is minted here and now while we hold the key.
+        // Best-effort: a device without the account key still revokes server-side, exactly as before.
+        const targetKey = view.devices.find((d) => d.deviceId === deviceId)?.deviceKey;
+        const seq = (await controller.revocationState?.())?.revoked ?? 0;
+        const record =
+          targetKey === undefined ? null : await controller.revokeDeviceKey?.(targetKey, seq + 1).catch(() => null);
+        void account.revokeDevice(deviceId, record ?? undefined).then(async (result) => {
           if (!result.ok) {
             // Surface the failure only where the user still IS: a foreground openSettings would clear
             // the Back latch and repaint Device Keys over the buddy list they already returned to.
@@ -6547,7 +6854,7 @@ export function mountApp(
           // buddy list (which would look like a dead Back and, on reload, drop to the login screen).
           await openSettings(undefined, true);
         });
-      });
+      })());
     });
     // Revoke THIS device: the deliberate confirmation. On confirm, burn this device's key, rotate it out
     // of the groups, then crypto-erase it and return to the unlock screen.
@@ -6737,6 +7044,67 @@ export function mountApp(
       } else {
         void controller.openChannel(view.conversationId).then((transmit) => go({ kind: 'conversation', transmit }));
       }
+    });
+    root.querySelector('[data-action="history-off"]')?.addEventListener('click', () => {
+      if (view.kind !== 'settings') {
+        return;
+      }
+      const v = view;
+      if (v.historyArm !== true) {
+        // Say what the second tap costs BEFORE it happens: this erases what is already stored here.
+        go({ ...v, historyArm: true });
+        showToast('this erases the messages already saved on this device, and cannot be undone');
+        return;
+      }
+      void (async () => {
+        await controller.setHistoryOff?.(true, true);
+        showToast('messages are no longer saved on this device');
+        await openSettings();
+      })();
+    });
+    root.querySelector('[data-action="history-on"]')?.addEventListener('click', () => {
+      if (view.kind !== 'settings') {
+        return;
+      }
+      void (async () => {
+        await controller.setHistoryOff?.(false);
+        showToast('messages are saved on this device again');
+        await openSettings();
+      })();
+    });
+    root.querySelector('[data-action="verify-mark"]')?.addEventListener('click', () => {
+      if (view.kind !== 'getinfo' || view.verify === undefined || view.verify.peerKey.length === 0) {
+        return;
+      }
+      const v = view;
+      const vi = v.verify;
+      if (vi === undefined) {
+        return;
+      }
+      // Trusting a CHANGED key is the dangerous branch (it is exactly what an attacker wants after a
+      // swap), so it takes two deliberate taps; a first-time verification is one tap.
+      if (vi.state === 'changed' && v.verifyArm !== true) {
+        go({ ...v, verifyArm: true });
+        showToast('are you sure? only trust the new key after confirming with them directly');
+        return;
+      }
+      void (async () => {
+        const ok = (await controller.markBuddyVerified?.(v.peer, vi.peerKey, vi.verifiedKey)) ?? false;
+        if (!ok) {
+          showToast('could not verify: the key moved, look again');
+        }
+        await openBuddyInfo(v.peer); // re-fetch so the panel shows the stored state, not a guess
+      })();
+    });
+    root.querySelector('[data-action="verify-clear"]')?.addEventListener('click', () => {
+      if (view.kind !== 'getinfo') {
+        return;
+      }
+      const peer = view.peer;
+      void (async () => {
+        await controller.clearBuddyVerified?.(peer);
+        await openBuddyInfo(peer);
+      })();
     });
     root.querySelector('[data-action="block-peer"]')?.addEventListener('click', () => {
       const ac = activeConv(view);
@@ -6942,6 +7310,40 @@ export function mountApp(
 
   // The account's current certificate epoch: the number of revoked devices (monotonic, server-tracked).
   // A revoke bumps it; devices re-certify at the current epoch so the gate's floor rises (ADR-022 P6).
+  /** ADR-022 P7 MIGRATION. Devices revoked before signed records existed carry a burned server row and
+   * nothing else, so they are excluded only by the epoch floor, which a seed-holder walks straight over.
+   * Any device that holds the account key mints the missing records the first time it sees the list and
+   * publishes them, so an account that was revoking devices for months converges on the real exclusion
+   * without the user doing anything.
+   *
+   * Guarded on ALREADY having a record for that key, so this runs once per revoked device and never
+   * mints a second, differently-sequenced record for the same target. Entirely best-effort: a failure
+   * here is retried on the next device-list read, and it must never break the login path it sits on.
+   */
+  async function backfillRevocationRecords(devices: readonly DeviceInfo[]): Promise<void> {
+    if (account === undefined || controller.revokeDeviceKey === undefined || controller.isDeviceRevoked === undefined) {
+      return;
+    }
+    let seq = (await controller.revocationState?.())?.revoked ?? 0;
+    for (const d of devices) {
+      if (!d.revoked) {
+        continue;
+      }
+      try {
+        if (await controller.isDeviceRevoked(d.deviceKey)) {
+          continue; // already covered by a record we hold
+        }
+        seq += 1;
+        const record = await controller.revokeDeviceKey(d.deviceKey, seq);
+        if (record !== null) {
+          await account.revokeDevice(d.deviceId, record); // idempotent: the row is already burned
+        }
+      } catch {
+        // No account key on this device, or the server refused. Retried on the next list read.
+      }
+    }
+  }
+
   async function currentAccountEpoch(): Promise<number> {
     if (account === undefined) {
       return 0;
@@ -6950,6 +7352,25 @@ export function mountApp(
       const res = await account.listDevices();
       if (!res.ok || res.devices === undefined) {
         return 0;
+      }
+      // Prefer the server's EXPLICIT monotonic counter. Counting revoked rows was the old derivation
+      // and it tied this security floor to how much device history happened to be retained: pruning
+      // old tombstones walked the epoch backward while every device's local floor stayed put, so the
+      // next paired device was certified below the floor and could never join. The count remains only
+      // as the fallback for a server that predates the counter, where the two are still equal.
+      // ADR-022 P7: the same response carries the account's signed revocation records, so take them
+      // here rather than paying a second round trip. This is the call every pre-pairing and post-revoke
+      // path already makes, which means a device cannot mint or publish without first having had the
+      // chance to learn who was thrown out. Each record is signature-checked against our own account
+      // key inside the worker, so a hostile server can withhold them (delaying exclusion) but cannot
+      // inject one. Awaited, not fired off: minting before ingesting would certify against a stale
+      // denylist, which is the exact ordering bug this whole mechanism exists to close.
+      if (res.revocations !== undefined && res.revocations.length > 0) {
+        await controller.ingestRevocations?.(res.revocations);
+      }
+      await backfillRevocationRecords(res.devices);
+      if (res.accountEpoch !== undefined) {
+        return res.accountEpoch;
       }
       return res.devices.filter((d) => d.revoked).length;
     } catch {
@@ -7326,6 +7747,7 @@ export function mountApp(
     }
     const gen = ++siblingHealGen; // this poll's identity; a newer heal or a teardown invalidates it
     siblingAddRejections.delete(newDeviceKey); // a fresh pairing starts with a clean slate
+    siblingAddRejectReasons.delete(newDeviceKey);
     const deadline = Date.now() + SIBLING_HEAL_WINDOW_MS;
     const tick = async (): Promise<void> => {
       siblingHealTimer = null;
@@ -7335,7 +7757,18 @@ export function mountApp(
       if ((siblingAddRejections.get(newDeviceKey) ?? 0) >= 2) {
         // The adder gate rejected this device's packages twice: deterministic for everything its
         // directory can serve, so further ticks would only burn more packages. Stop and tell the user.
-        showToast('could not add the new device. revoke it in Device keys and pair it again');
+        //
+        // The old copy here told them to REVOKE the device and pair it again. That was actively harmful:
+        // revoking is the one action that permanently burns the device's key and (ADR-022 P7) writes a
+        // signed record excluding it forever, so following the advice made the state worse every time,
+        // and the user could repeat it indefinitely without ever being told why. Say what happened and
+        // point at starting the pairing over, which is what actually produces a fresh, admissible key.
+        const reason = siblingAddRejectReasons.get(newDeviceKey);
+        showToast(
+          reason === undefined
+            ? 'could not add the new device. start the pairing again from that device'
+            : `could not add the new device (${reason}). start the pairing again from that device`,
+        );
         return;
       }
       await reconcileRemovals();
@@ -7406,6 +7839,17 @@ export function mountApp(
   // DESIGNATED device (the lexicographically lowest device key) creates it, and only once; every other
   // device waits for the Welcome and joins it silently. Triggered on login, a device add, and a roster
   // change, and a no-op once it exists (so re-triggering is cheap).
+  //
+  // LIVENESS FALLBACK (SG1): the election used to be absolute — if the designated device could not mint
+  // (a cert-only phone cannot anchor a solo group; any of its guards can fail), NO device ever formed
+  // the group, and the account sat with two healthy devices and no self-group, permanently (observed
+  // live: no formation for 19 hours, both devices online). So a non-designated device now WAITS ONE
+  // GRACE WINDOW for the designated device's group to appear, and then mints itself. The window keeps
+  // the normal case race-free (one minter); the deterministic canonical selection (certified > largest
+  // roster > lowest id) converges the rare double-mint. Formation can stall for a window; it can no
+  // longer stall forever.
+  const SELF_MINT_FALLBACK_MS = 45000;
+  let selfMintDeferredSince: number | null = null;
   let ensuringSelfGroup = false;
   async function ensureSelfGroup(): Promise<void> {
     if (
@@ -7445,13 +7889,28 @@ export function mountApp(
         }
         return;
       }
-      // Deterministic single creator: only the lowest-keyed device creates it; others join via the Welcome.
-      if ([...ownDeviceKeys].sort()[0] !== currentDeviceKey) {
+      if (await controller.hasSelfGroup()) {
+        selfMintDeferredSince = null; // a self-group exists: nothing to form, and no fallback is armed
         return;
       }
-      if (await controller.hasSelfGroup()) {
-        return; // already created (restored on reload via the durable blob): nothing to do
+      // Deterministic single creator: the lowest-keyed device creates it; others join via the Welcome.
+      // A non-designated device no longer defers FOREVER: the first time it sees "no self-group and I am
+      // not the minter" it arms a grace window; if the designated device's group has STILL not appeared
+      // on a later trigger past that window, the designated device has failed to mint (it may be UNABLE
+      // to — a cert-only device cannot anchor a solo group), so this device mints instead. The window
+      // keeps the normal case single-minter; the deterministic canonical selection converges the rare
+      // race where both mint near-simultaneously.
+      if ([...ownDeviceKeys].sort()[0] !== currentDeviceKey) {
+        if (selfMintDeferredSince === null) {
+          selfMintDeferredSince = Date.now();
+          return; // first sight: give the designated device its window
+        }
+        if (Date.now() - selfMintDeferredSince < SELF_MINT_FALLBACK_MS) {
+          return; // still inside the window: keep waiting for the designated device's Welcome
+        }
+        console.warn('self-group fallback: the designated device has not formed the group; minting from this device');
       }
+      selfMintDeferredSince = null;
       const own = await account.takeKeys(currentUsername);
       const targets: DeviceTarget[] =
         own.ok && own.devices !== undefined
@@ -7843,7 +8302,12 @@ export function mountApp(
       if (background && error === undefined && view.kind === 'settings' && settingsProjection(view.devices) === settingsProjection(res.devices)) {
         return; // nothing the screen shows changed: skip the rebuild so it cannot eat an in-flight tap
       }
-      go(error !== undefined ? { kind: 'settings', devices: res.devices, currentDeviceKey, error } : { kind: 'settings', devices: res.devices, currentDeviceKey });
+      const historyOff = (await controller.historyOffEnabled?.()) ?? false;
+      go(
+        error !== undefined
+          ? { kind: 'settings', devices: res.devices, currentDeviceKey, historyOff, error }
+          : { kind: 'settings', devices: res.devices, currentDeviceKey, historyOff },
+      );
     } else {
       if (background) {
         // A transient device-list failure during a BACKGROUND refresh must not tear the screen down into
@@ -7973,10 +8437,11 @@ export function mountApp(
     // These three depend on the buddy usernames, so they form the second (also parallel) wave. The cached
     // E2E buddy icons + away messages each come in ONE worker call; buddies with none get a placeholder /
     // no subtitle. Away text is shown as the dim subtitle only while the buddy's presence is away.
-    const [statuses, icons, awayText] = await Promise.all([
+    const [statuses, icons, awayText, verify] = await Promise.all([
       loadBuddyStatuses(buddies),
       controller.buddyIcons?.(buddies.map((b) => b.username)) ?? Promise.resolve<Record<string, BuddyIcon>>({}),
       controller.buddyAwayText?.(buddies.map((b) => b.username)) ?? Promise.resolve<Record<string, string>>({}),
+      controller.buddyVerifyStates?.(buddies.map((b) => b.username)) ?? Promise.resolve<Record<string, BuddyVerifyBadge>>({}),
     ]);
     // A buddy entry that is YOU is authenticated to yourself by definition: you are signed in right
     // here. Show your live status (the same online/away the header ◆ shows) and your own buddy icon
@@ -8020,6 +8485,7 @@ export function mountApp(
       ownName: currentUsername,
       icons,
       awayText,
+      ...(Object.keys(verify).length > 0 ? { verify } : {}),
       ...(error !== undefined ? { error } : {}),
       ...(Object.keys(signals).length > 0 ? { signals } : {}),
     });
@@ -8570,6 +9036,23 @@ export function mountApp(
       go({ kind: 'unlock', mode: 'register', error: 'the passphrases do not match' });
       return;
     }
+    // ONE registration at a time. Without this, a second click fired a second concurrent run: one POST
+    // got 201 and the other 409, and the 409 branch called discardAccount, which crypto-erased the vault
+    // and account seed of the account that had just been created on the server. The user was left with a
+    // live account whose keys existed nowhere. The proof of work makes a double click likelier, not less,
+    // by putting a visible pause between the click and any feedback.
+    if (registerInFlight) {
+      return;
+    }
+    registerInFlight = true;
+    try {
+      await doRegisterInner(user, pass);
+    } finally {
+      registerInFlight = false;
+    }
+  }
+
+  async function doRegisterInner(user: string, pass: string): Promise<void> {
     const res = await controller.unlock(user, pass);
     if (!res.ok) {
       go({ kind: 'unlock', mode: 'register', error: res.error ?? 'could not create the account' });
@@ -8768,6 +9251,12 @@ export function mountApp(
     }
     const raw = (await controller.getBuddyInfo?.(username)) ?? [];
     const peers = raw.map((p) => ({ ...p, bio: substituteSpecials(p.bio, { name: currentUsername, at }) }));
+    let verify: BuddyVerifyInfo | undefined;
+    try {
+      verify = await controller.buddyVerifyInfo?.(username);
+    } catch {
+      verify = undefined; // no panel beats a wrong panel
+    }
     let presence: string | undefined;
     let away: string | undefined;
     if (account !== undefined) {
@@ -8777,7 +9266,7 @@ export function mountApp(
         away = a;
       }
     }
-    go({ kind: 'getinfo', conversationId: '', peer: username, peers, origin: 'buddies', ...(presence !== undefined ? { presence } : {}), ...(away !== undefined ? { away } : {}) });
+    go({ kind: 'getinfo', conversationId: '', peer: username, peers, origin: 'buddies', ...(verify !== undefined ? { verify } : {}), ...(presence !== undefined ? { presence } : {}), ...(away !== undefined ? { away } : {}) });
   }
 
   // Add another account to the open conversation: resolve all their devices and add each to the MLS
@@ -8975,6 +9464,37 @@ export function mountApp(
         // FULL channel sweep (decrypt every row) just to name one sender:
         //  - a notification wants ONE peer name: an O(1) single-row lookup (peerFor);
         //  - the Channels pane, if we are on it, wants the refreshed list (badges + previews).
+        // AIM behavior: an arriving message OPENS ITS WINDOW IN FRONT so you can answer it, rather than
+        // only announcing itself. Two cases:
+        //  - the conversation is DOCKED (minimized): respect that deliberate choice, leave it docked, and
+        //    mark its chip unread so the user sees something is waiting (handled below).
+        //  - otherwise: pop the conversation window to the front. This also arms the message's burn
+        //    countdown, because viewing is what starts an inbound timer (hold-until-seen) — a message that
+        //    only raised a toast sat unseen and its countdown never began.
+        // Never steal focus during the pairing wizard, a modal/guided flow, or a transient editor holding
+        // an unsaved draft: those windows own the screen and yanking the user out loses work.
+        const dockedKey = `conv:${p.conversationId}`;
+        const isDocked = minimizedWins.some((m) => m.key === dockedKey);
+        const popOk =
+          !isDocked &&
+          !joiningNewDevice &&
+          view.kind !== 'provisioning' &&
+          Date.now() >= suppressAutoOpenUntil &&
+          isPrimaryWindow(view); // a primary window (buddy list / channels / another chat) may be superseded
+        if (isDocked) {
+          // Keep it docked, but make the dock say so.
+          minimizedWins = minimizedWins.map((m) => (m.key === dockedKey ? { ...m, unread: (m.unread ?? 0) + 1 } : m));
+          render();
+        } else if (popOk) {
+          void controller.openChannel(p.conversationId).then((transmit) => {
+            // Re-check at resolve time: the user may have navigated somewhere focus-sensitive while the
+            // decrypt was in flight.
+            if (joiningNewDevice || view.kind === 'provisioning' || !isPrimaryWindow(view)) {
+              return;
+            }
+            go({ kind: 'conversation', transmit });
+          });
+        }
         if (notifyEnabled) {
           const nameLookup = controller.peerFor !== undefined ? controller.peerFor(p.conversationId) : Promise.resolve('');
           void nameLookup.then(
@@ -9156,9 +9676,16 @@ export function mountApp(
       // The adder-side gate refused a sibling's key package (deterministic for that package). Count it
       // so the heal poll stops claiming fresh packages for a device whose directory only serves
       // rejected ones (two strikes abort the poll with a toast).
-      const p = ev.payload as { deviceKey?: string };
+      const p = ev.payload as { deviceKey?: string; detail?: string };
       if (typeof p.deviceKey === 'string' && p.deviceKey !== '') {
         siblingAddRejections.set(p.deviceKey, (siblingAddRejections.get(p.deviceKey) ?? 0) + 1);
+        // Keep the REASON, not just the count. The crypto layer's message names the leaf's epoch, this
+        // conversation's floor, and this device's global floor, and until now it existed only in a
+        // console.warn: diagnosing a stuck pairing meant guessing at three numbers that were sitting
+        // right there. They are counters, not secrets.
+        if (typeof p.detail === 'string' && p.detail !== '') {
+          siblingAddRejectReasons.set(p.deviceKey, p.detail);
+        }
       }
       return;
     }

@@ -15,7 +15,8 @@ bus" true by construction. The client does all cryptography.
   [ Packaged client / web client ]      <- holds keys, does ALL crypto
             |  wss (TLS, common-stack fingerprint)
             v
-  [ Apache vhost: mod_proxy_wstunnel ]   <- TLS termination, decoy site at same domain (M3)
+  [ Apache vhost: mod_proxy_wstunnel ]   <- TLS termination (NO decoy site: the landing page
+                                             describes the product openly, see threat-model P5)
             |  ws (loopback)
             v
   [ Go gateway (systemd, CGO_ENABLED=0) ]

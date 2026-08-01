@@ -8,6 +8,47 @@ Format: gate, status, decision, why, residual / honest limit.
 
 ---
 
+## ADR-022 P7 — Device revocation is an identity denylist, not an epoch floor
+- **Status:** Decided and implemented (2026-07-29). Crypto: 122 Rust tests, including two written
+  BEFORE the fix as the acceptance criteria, plus mutation checks on all three gate sites. Control
+  plane: PHPStan-max clean, 45 PHPUnit tests. Client: tsc + eslint clean, 558 vitest tests.
+- **Context / what was actually broken:** P6 excluded a revoked device with an epoch FLOOR: every
+  certificate carries a `cert_epoch`, a revoke bumps the account epoch, remaining devices re-certify
+  at the new epoch and raise a monotonic local floor, and the gate refuses any leaf below it. That
+  reasoning has a hole with no patch: **a floor is a lower bound, and it cannot exclude a party that
+  picks the number.** Revocation is a server-side act. It burns a directory row, cuts sessions, and
+  deletes key packages, and it cannot reach the revoked device's own disk, where its copy of the
+  ACCOUNT SEED still sits. A revoked seed-holder simply re-certifies itself at `u32::MAX` (the
+  `reauthorizeAtEpoch` binding takes the epoch unbounded from JS), sails over any floor an honest
+  device will ever reach, and is re-admitted. The failing test
+  `a_revoked_seed_holder_cannot_recertify_its_way_back_in` was written first and demonstrated exactly
+  this before any fix existed.
+- **Decision:** exclusion turns on **identity**, not ordering. A revoke now also mints a 140-byte
+  **revocation record**: `magic "DDR1" | aak_pub(32) | target_sig_key(32) | issued_seq(8) |
+  Ed25519(aak, "deaddrop-device-revoke-v1" || aak_pub || target || seq)`, signed by the account
+  authorization key. The gate (`check_added_leaf`, mirrored in the self-group birth gate and the
+  key-package pre-filter) refuses a named key however high an epoch it certifies itself at. The
+  control plane stores and serves these blobs opaquely; it holds no account key, so it can withhold a
+  record (a liveness failure) and can never forge one. Records are append-only and re-verified at
+  every point of use, so nothing that fails a signature check can ever act as a revocation.
+- **The floor stays, with a smaller job.** It still blocks credential rollback for the cert-only
+  majority, who cannot mint at all. Two changes make it honest: it is now DERIVED as `|records|`, a
+  number every device computes offline from the same evidence rather than accepting from the server's
+  counter; and a mint that is handed an epoch below the local floor now **certifies AT the floor**
+  instead of erroring. Erroring was the first fix and it was wrong: the requested epoch comes from the
+  control plane and the floor is device-local, so any drift between them blocked pairing outright with
+  nothing the user could do. Raising is always safe (a lower bound only tightens), and with exclusion
+  moved to the denylist, an inflated epoch buys an attacker nothing.
+- **Blast radius of the original hole:** seed-holders only. A device paired by QR or six words adopts
+  a certificate and never learns the seed, so it cannot re-certify at all; that boundary is pinned by
+  `a_revoked_CERT_ONLY_device_cannot_recertify_at_all_bounding_the_attack`.
+- **Residual / honest limit:** a device that is revoked before it has been served the record still
+  passes gates that have not received the record either, so a compelled server can DELAY exclusion. It
+  cannot reverse it: once a device holds a record, nothing retracts it. Anyone holding the recovery
+  secret can still provision a NEW device, which is a property of the recovery secret and is documented
+  separately. Records name a device key in the clear, which tells the server nothing it does not
+  already hold (the same key is its directory row). Both are in honest-limits.
+
 ## ADR-022 — Multi-device identities + device management (single-active routing)
 - **Status:** Decided and implemented (2026-06-27). Server: PHPStan-max clean, PHPUnit 11 tests / 80
   assertions (device registry, two-factor enroll, idempotency, foreign-key rejection, revoke +
@@ -236,6 +277,9 @@ Format: gate, status, decision, why, residual / honest limit.
   fully testable with WebCrypto), then Layer 1 (Rust encrypting StorageProvider + Worker +
   IndexedDB + Argon2id wiring), then revoke. Panic-wipe UX, duress/decoy, and the ephemeral-mode
   toggle complete at M4 (Gate 15's stated milestone).
+  **Status correction (2026-07):** that plan did NOT fully land. Panic wipe shipped as Self
+  Destruct. Duress passphrase and decoy mode were never built and are not scheduled; the
+  threat-model P4 row and honest-limits items 1, 3, and 7 now say so plainly.
 - **Adversarial review hardening applied (both reviewers: sound):** Argon2id uses explicit
   pinned params (64 MiB, 3 passes, not library defaults), with a param-drift test, since this is
   the sole passphrase-only at-rest barrier; the at-rest AEAD binds a format-version byte as AAD

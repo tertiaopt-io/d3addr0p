@@ -158,7 +158,11 @@ export class LiveChannel {
     this.conv = conv;
     this.identity = identity;
     this.selfRoutingKey = identity.signatureKeyHex;
-    if (restored === null && this.persistence !== undefined) {
+    if (this.persistence !== undefined) {
+      // ALWAYS persist, not just for a fresh identity: `identity.keyPackage` above was just minted
+      // into the provider's storage map, and on the RESTORE path the existing blob does not contain
+      // its private half. Handing out a package that dies on the next reload is the same defect that
+      // split the self-group — seal it before anyone can claim it.
       await this.persistence.saveSelf(conv);
     }
     this.transport = this.deps.connect(url, this.handlers());

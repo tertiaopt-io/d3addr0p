@@ -22,7 +22,7 @@
 import { GroupSession, receiveGroup, type GroupConversationLike } from './group.js';
 import { CONTROL_FILE, CONTROL_CALL, CONTROL_BUDDY_ICON, CONTROL_PROFILE, CONTROL_AWAY, CONTROL_BUDDIES, CONTROL_GROUPS } from './session.js';
 import { Provisioning, deriveProvMailbox, type ProvisioningDeps } from './provisioning.js';
-import { renderSasHex } from './sas.js';
+import { renderSasHex, renderContactPhraseHex } from './sas.js';
 import type { Transport, TransportHandlers } from './transport.js';
 import type { EnvelopeMsg } from './session.js';
 import type { LogEntry, TransmitModel, ChannelSummary } from './app.js';
@@ -48,6 +48,14 @@ export function formatContact(sigHex: string): string {
 
 function bytesToHex(b: Uint8Array): string {
   return [...b].map((x) => x.toString(16).padStart(2, '0')).join('');
+}
+
+function hexToBytes(s: string): Uint8Array {
+  const out = new Uint8Array(s.length >> 1);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = parseInt(s.slice(i * 2, i * 2 + 2), 16);
+  }
+  return out;
 }
 
 function errMsg(e: unknown): string {
@@ -96,6 +104,9 @@ export interface GroupDeps {
   restoreConversation(msk: Uint8Array, sealed: Uint8Array): GroupConversationLike;
   /** The 66-bit device-provisioning SAS digest (wasm free function), bound to the transcript. */
   sasDigestHex(nonceHex: string, accountPubHex: string, deviceKeyHex: string, certEpoch: number): string;
+  /** The contact identity digest for ONE account key (wasm free function). Optional so hosts on an
+   * older wasm simply show no verify section. */
+  contactIdentDigestHex?: ((aakHex: string) => string) | undefined;
   /** QR-pairing box primitives (wasm free functions); optional so hosts without them still run the
    * 6-word flow. Fresh ephemeral X25519 keypair (secret||public), seal a grant to a public key, open a
    * sealed grant with a secret. */
@@ -122,10 +133,29 @@ export interface GroupPersistence {
   /** Re-seal our durable identity, OVERWRITING the stored one. Used after a provisioned device adopts
    * its certificate, so the now-authorized identity survives a reload (saveSelf is create-if-absent
    * and must not clobber a stable identity, so adoption needs this explicit re-seal). */
-  resealSelf(conv: GroupConversationLike): Promise<void>;
+  // Resolves TRUE only when the sealed blob actually reached storage. Callers that are about to
+  // publish something derived from in-memory key material MUST check it (see freshKeyPackages).
+  resealSelf(conv: GroupConversationLike): Promise<boolean>;
   /** The account's recovery-secret seed (hex) if this device holds it (the registering/seed-holder
    * device), else '' for a device that joins by provisioning and never learns the seed (model b). */
   recoverySeedHex(): Promise<string>;
+  /** The durable pending-Welcome outbox (sealed device-local). Optional so a degraded build without a
+   * session store still runs; without it a Welcome is simply as fragile as it was before. */
+  loadWelcomeOutbox?(): Promise<PendingWelcome[]>;
+  saveWelcomeOutbox?(entries: readonly PendingWelcome[]): Promise<void>;
+}
+
+/** A Welcome we published and have no evidence was ever processed. The gateway bus holds an
+ * undelivered blob only IN MEMORY and clamps its TTL to a day, so a restart, a crash, or a sibling
+ * that stays offline long enough destroys it with neither side informed — and a BIRTH create (the
+ * founding self-group) has no pendingKind, so the reconnect re-publish loop skips it. Keeping our own
+ * copy makes the founding Welcome as durable as a staged add's, without the gateway persisting
+ * anything (the at-rest threat model is unchanged). */
+export interface PendingWelcome {
+  conversationId: string;
+  deviceKey: string; // the recipient's bootstrap mailbox
+  welcomeHex: string;
+  createdAt: number;
 }
 
 /** One open conversation's live state. The MLS group id lives in `session.groupId`; the conversationId
@@ -139,11 +169,31 @@ interface SessionEntry {
 export class GroupChannel {
   private transport: Transport | null = null;
   private connectGen = 0; // bumped per connectGateway; a superseded socket's events are ignored
+  // The highest account epoch the directory has reported this session (see syncEpoch). Feeds mintEpoch,
+  // so a device we certify is born at or above the account's authorization floor rather than at 0.
+  private lastAccountEpoch = 0;
   private conv: GroupConversationLike | null = null;
   private bootstrapKey = ''; // our signature key = our bootstrap mailbox
   // Every open conversation, keyed by conversationId (= `c-${groupId}`). One device holds MANY at once;
   // inbound messages self-route by group id (receiveGroup) and we map the group id back to its entry.
   private readonly sessions = new Map<string, SessionEntry>();
+  // Welcomes we published and have no evidence were processed. Loaded once per connect, re-published
+  // on every reconnect, retired when the conversation shows a frame we did not author.
+  private welcomeOutbox: PendingWelcome[] = [];
+  private welcomeOutboxLoaded = false;
+  // ON-SCREEN DIAGNOSTIC (self-group split). Chrome/iOS has no usable console and device-local MLS
+  // state is invisible to the keyless gateway, so the only way to see what a Welcome actually did on
+  // the phone is to render it. Counted since this worker started (a full reload resets them; the
+  // subtitle says so), and deliberately NOT stored in the sealed conversation blob — that blob is
+  // exactly what one candidate cause says failed to commit, so a diagnostic riding it could not tell
+  // the two causes apart.
+  private welcomesSeen = 0;
+  private welcomesJoined = 0;
+  private lastWelcomeError = '';
+  /** Conversations with inbound traffic awaiting a receive-ratchet flush (see scheduleRatchetFlush). */
+  private readonly ratchetFlushPending = new Set<string>();
+  /** The ONE debounce handle covering all of them. */
+  private ratchetFlushTimer: unknown = null;
   private provisioning: Provisioning | null = null; // the device-provisioning state machine, when active
   // A sibling add in flight per conversation (ADR-022 self-heal): we staged its commit and are waiting
   // for our own echo to confirm it. `handle` is the confirm-backstop timer. Cleared when that
@@ -331,13 +381,23 @@ export class GroupChannel {
       // leaf win the gid tie-break here while a sibling picks the certified group, and our buddy
       // publishes would be dropped at its gate.
       const strict = entry.session.isSelfConversationStrict();
-      if (
+      // POPULATED BEATS SOLO, ahead of strictness. A solo self-group (just this device) can never sync
+      // anything: it has no sibling to deliver to. Ranking strict FIRST let a freshly minted certified
+      // SOLO replacement outrank the real shared group, so each device silently converged on its own
+      // island and notes stopped crossing (observed live). Within the same population class the original
+      // order still applies: strict, then larger roster, then lowest id — so the certified-replacement
+      // preference that this ordering exists for is preserved wherever it actually matters.
+      const populated = entry.session.roster().length > 1;
+      const bestPopulated = best !== null && best.roster().length > 1;
+      const better =
         best === null ||
-        (strict && !bestStrict) ||
-        (strict === bestStrict &&
-          (entry.session.roster().length > best.roster().length ||
-            (entry.session.roster().length === best.roster().length && entry.session.groupId < best.groupId)))
-      ) {
+        (populated && !bestPopulated) ||
+        (populated === bestPopulated &&
+          ((strict && !bestStrict) ||
+            (strict === bestStrict &&
+              (entry.session.roster().length > best.roster().length ||
+                (entry.session.roster().length === best.roster().length && entry.session.groupId < best.groupId)))));
+      if (better) {
         best = entry.session;
         bestStrict = strict;
       }
@@ -362,6 +422,14 @@ export class GroupChannel {
     if (best.strict || this.conv === null || this.conv.accountKeyHex().length === 0) {
       return true;
     }
+    // A POPULATED self-group always suffices, even if only lenient-classified. The replacement mint
+    // below produces a SOLO group (createSelf adds nobody), so minting one while a real shared group
+    // exists strands this device alone on it: the certified-solo copy then outranked the shared group
+    // and notes stopped crossing devices. A lenient shared group still reaches every sibling, which is
+    // the whole point of the self-group; upgrading it is not worth losing it.
+    if (best.session.roster().length > 1) {
+      return true;
+    }
     // A replacement mint is worthwhile ONLY when it would come out strict: a legacy label-only
     // credential (pre-cert sealed blobs restore this way) would mint another lenient-only group, and
     // the gate would see "still insufficient" forever, minting one more group per trigger. For that
@@ -382,6 +450,38 @@ export class GroupChannel {
     return s === null ? null : this.convId(s.groupId);
   }
 
+  /** ON-SCREEN DIAGNOSTIC for the Note-to-Self subtitle, rendered next to the group id.
+   *
+   * ROSTER SIZE is the datum that settles a question the group id alone cannot: which device MINTED.
+   * A populated self-group lists both devices; a solo one lists a single device. So `2 devices` on the
+   * phone and `1 device` on the laptop means the phone minted and the laptop never joined — the exact
+   * inverse of `1 device` / `2 devices`. Neither is visible to the keyless gateway.
+   *
+   * W<seen>/<joined> counts Welcomes that reached our bootstrap mailbox versus ones that actually
+   * produced a group, since this worker started (a full reload resets it). W>=1 with joined 0 plus an
+   * error means the join was REJECTED; W>=1 with joined >=1 means it succeeded and the group was lost
+   * afterwards; W 0 means no Welcome arrived at all in this session. */
+  selfGroupDiagnostic(): string {
+    const parts: string[] = [];
+    const session = this.selfSession();
+    if (session !== null) {
+      let n = 0;
+      try {
+        n = session.roster().length;
+      } catch {
+        /* a group whose roster the wasm cannot read still reports its counters below */
+      }
+      if (n > 0) {
+        parts.push(`${n} device${n === 1 ? '' : 's'}`);
+      }
+    }
+    parts.push(`W${this.welcomesSeen}/${this.welcomesJoined}`);
+    if (this.lastWelcomeError !== '') {
+      parts.push(shortWelcomeError(this.lastWelcomeError));
+    }
+    return parts.join(' · ');
+  }
+
   /** Whether a SPECIFIC conversation id is one of our hidden own-devices self-groups. Unlike
    * selfConversationId (which returns only the single BEST self-group), this recognizes ANY loaded
    * self-group session, so a stale second self-group's id is still classified as self and kept out of
@@ -392,12 +492,122 @@ export class GroupChannel {
     return entry !== undefined && entry.session.isSelfConversation();
   }
 
+  /** READ-ONLY diagnostic: the classifier's reason a held conversation is or is not a self-group
+   * ("self" when it is). '' when we do not hold it or the wasm lacks the accessor. Surfaced so a stuck
+   * self-classification is diagnosed by reading the cause, not guessing at the roster. */
+  selfClassificationReason(conversationId: string): string {
+    const entry = this.sessions.get(conversationId);
+    if (entry === undefined) {
+      return '';
+    }
+    return entry.session.selfClassificationReason();
+  }
+
+  /** SG2 SELF-HEAL: abandon a self-group that is provably dead (a frozen certless leaf: unrepairable in
+   * place, never syncs) so the account can reform a clean one automatically. `recordedSelf` is the
+   * caller's durable record that this id IS one of our self-groups; the crypto layer refuses without it
+   * (it cannot tell a poisoned self-group from a pending peer chat) and refuses any group that still has
+   * a verified sibling. Drops the local session + subscription and re-seals on success. Returns whether
+   * it abandoned one; never throws (a refusal is the expected, safe outcome). */
+  async abandonDeadSelfGroup(conversationId: string, recordedSelf: boolean): Promise<boolean> {
+    const conv = this.conv;
+    if (conv === null || conv.abandonDeadSelfGroup === undefined) {
+      return false;
+    }
+    const gid = conversationId.startsWith('c-') ? conversationId.slice(2) : conversationId;
+    let abandoned = false;
+    try {
+      abandoned = conv.abandonDeadSelfGroup(gid, recordedSelf);
+    } catch {
+      return false; // refused (still reachable / not recorded / unsettled): the safe outcome
+    }
+    if (!abandoned) {
+      return false;
+    }
+    this.leaveConversation(conversationId); // drop the session + unsubscribe its mailbox
+    await this.resealSelf();
+    return true;
+  }
+
+  /** Re-publish our buddy list, group list, and identity into the CANONICAL self-group. Idempotent (the
+   * buddy/group stores are versioned CRDTs, so a re-publish only advances a peer that is behind) and
+   * self-group-guarded inside each helper (the contact graph never rides a peer roster). Called on every
+   * reconnect: a sibling that missed an earlier one-time publish (its certificate had not settled when
+   * the frame arrived, so it was dropped as not-from-our-account) converges on the next reconnect of ANY
+   * member, instead of waiting for a buddy-list EDIT that may never come. */
+  private resyncSelfGroup(): void {
+    const session = this.selfSession();
+    if (session === null) {
+      return;
+    }
+    this.publishIdentityFor(session);
+    this.publishBuddiesFor(session);
+    this.publishGroupsFor(session);
+  }
+
   /** Whether a held conversation provably has NO reachable recipient (a certless non-own leaf and no
    * verified foreign device). Advisory only; a real peer conversation, even one whose peer never comes
    * online, is never flagged. False when the wasm lacks the accessor or the session is not held. */
   isUnlinkedConversationId(conversationId: string): boolean {
     const entry = this.sessions.get(conversationId);
     return entry !== undefined && entry.session.unlinked();
+  }
+
+  /** Persist the advanced receive ratchet for a conversation shortly after inbound traffic settles.
+   *
+   * The library writes its message secrets when it SENDS, never when it receives, so without this the
+   * sealed blob on disk keeps a ratchet from before the messages we just processed, and anyone who
+   * images a powered-off device plus recorded traffic can re-derive them. One debounce covers ALL
+   * conversations, so a burst of arrivals costs one flush per busy group (each flush spends one of that
+   * group's send generations) and exactly one re-seal, only when a flush actually happened.
+   */
+  private scheduleRatchetFlush(conversationId: string): void {
+    this.ratchetFlushPending.add(conversationId);
+    if (this.ratchetFlushTimer !== null) {
+      return; // one timer covers every conversation: see below for why that matters
+    }
+    this.ratchetFlushTimer = this.deps.schedule(RATCHET_FLUSH_MS, () => {
+      this.ratchetFlushTimer = null;
+      const ids = [...this.ratchetFlushPending];
+      this.ratchetFlushPending.clear();
+      // Flush is PER GROUP (each has its own ratchet), but the re-seal is not: resealSelf serializes
+      // and AEAD-seals the container for EVERY conversation at once. An earlier cut debounced per
+      // conversation and re-sealed inside each timer, so an account with N busy conversations paid N
+      // full re-seals. Measured: ~1ms and 9KB at one conversation, ~46ms and 450KB at fifty, and the
+      // worker runs ops serially, so that was tens of milliseconds of blocked sends and megabytes of
+      // IndexedDB writes per minute. Flush them all, then seal once.
+      let flushed = false;
+      for (const id of ids) {
+        const entry = this.sessions.get(id);
+        if (entry !== undefined && entry.session.flushReceiveRatchet()) {
+          flushed = true;
+        }
+      }
+      if (flushed) {
+        void this.resealSelf(); // the advanced ratchet only protects anything once it is on disk
+      }
+    });
+  }
+
+  /** The distinct foreign account keys (hex) of one conversation's cert-verified members. Empty when
+   * the session is not held, the wasm is older, or nothing verifies (fail-safe). */
+  peerAccountKeysFor(conversationId: string): string[] {
+    return this.sessions.get(conversationId)?.session.peerAccountKeys() ?? [];
+  }
+
+  /** The contact identity phrase for ONE account key, or '' when the wasm lacks the digest, the key is
+   * missing, or anything throws. Callers render OUR phrase and THEIRS separately and both people
+   * compare both halves. Never returns a phrase it could not actually derive. */
+  contactPhraseFor(aakHex: string): string {
+    if (!/^[0-9a-f]{64}$/.test(aakHex)) {
+      return '';
+    }
+    try {
+      const digest = this.deps.contactIdentDigestHex?.(aakHex);
+      return digest !== undefined ? renderContactPhraseHex(digest) : '';
+    } catch {
+      return '';
+    }
   }
 
   /** CLOSE one conversation for good, locally: drop the live session (cancelling any in-flight staged
@@ -558,7 +768,11 @@ export class GroupChannel {
     for (const d of eligible) {
       // Only the FOUNDING members get the Welcome: a filtered-out device is not in it and could not
       // decrypt it (an undecodable frame would just sit poisoning its bootstrap mailbox).
-      t.publish({ messageId: randomBytes(16), routingKey: d.deviceKey, payload: welcome, ttlSeconds: SEVEN_DAYS });
+      t.publish({ messageId: randomBytes(16), routingKey: d.deviceKey, payload: welcome, ttlSeconds: WELCOME_TTL_SECONDS });
+      // A BIRTH create has no pendingKind, so the reconnect re-publish loop skips it: without this the
+      // founding Welcome is issued exactly ONCE, into a bus that holds it only in memory. That is how
+      // the account split — the sibling never joined and nothing ever tried again.
+      await this.rememberWelcome(conversationId, d.deviceKey, welcome);
     }
     await this.resealSelf(); // the self-group must survive reload (restored via listConversations; no summary)
     this.publishIdentityFor(session); // sync our icon/profile/away privately too (own devices; harmless)
@@ -850,23 +1064,36 @@ export class GroupChannel {
         if (entry.session.pendingKind() === null) {
           return; // an echo or a competing commit already resolved the staged op: nothing to confirm
         }
+        // Re-armed after a reload: still a wall clock, still not evidence. Abandon rather than merge.
         try {
           if (kind === 'add') {
-            entry.session.confirmAdd();
+            entry.session.abortAdd();
           } else {
-            entry.session.confirmRemove();
+            entry.session.abortRemove();
           }
         } catch {
           return;
         }
-        void this.onMembershipAdvanced(conversationId, kind === 'add' ? [target] : [], kind === 'remove' ? [target] : []);
+        this.deps.pushEvent('membership-stalled', { conversationId, kind });
       });
       this.pendingOps.set(conversationId, { kind, handle });
     }
+    // Re-publish every Welcome we have no evidence was processed. The loop above only covers a STAGED
+    // add (pendingKind !== null); a founding self-group create is a birth, so before the outbox its
+    // Welcome was published exactly once and a bus restart, a crash, or a sibling offline past the 24h
+    // clamp lost it permanently and silently. The bus is deliberately amnesiac, so durability lives here.
+    void this.replayWelcomeOutbox();
     // 'secure' once ANY end-to-end session is restored (the hidden own-devices self-group counts): the
     // account's E2E context is live, so the buddy list reads SECURE LINK rather than sitting forever on
     // the transitional SECURING. Only a brand-new device with no session yet reports the bare transport up.
     this.deps.pushEvent('connection', { state: this.sessions.size > 0 ? 'secure' : 'live' });
+    // Re-publish our contact graph into the canonical self-group on every reconnect. A sibling that
+    // missed an earlier one-time publish (its certificate had not settled when the frame arrived, so the
+    // frame was received-then-dropped as not-from-our-account, and it is now gone from the bus) converges
+    // here instead of waiting for a buddy-list EDIT that may never happen. Idempotent (versioned CRDTs)
+    // and self-group-guarded, so it never leaks the contact graph onto a peer roster. Fire-and-forget
+    // AFTER the connection event, so it never widens the pre-subscribe frame-buffering window above.
+    this.resyncSelfGroup();
     return { ok: true, selfContact: formatContact(this.bootstrapKey) };
   }
 
@@ -1151,20 +1378,23 @@ export class GroupChannel {
       return;
     }
     t.publish({ messageId: randomBytes(16), routingKey: oldMailbox, payload: commit, ttlSeconds: SEVEN_DAYS });
+    // Same rule as the staged add: a timeout is not evidence of delivery, so it abandons the staged
+    // Remove instead of merging it. A revoke that does not take is retried by reconcileRemovals on the
+    // next secure connection, which is the designed self-heal; a private key period is not.
     const handle = this.deps.schedule(ADD_CONFIRM_MS, () => {
       if (this.connectGen !== armedGen || !this.pendingOps.has(conversationId)) {
         return; // a reconnect superseded this backstop, or it was already resolved
       }
       this.pendingOps.delete(conversationId);
       if (entry.session.pendingKind() === null) {
-        return; // an echo or a competing commit already resolved the remove: nothing to confirm or announce
+        return; // an echo or a competing commit already resolved the remove: nothing to abandon
       }
       try {
-        entry.session.confirmRemove();
+        entry.session.abortRemove();
       } catch {
         return;
       }
-      void this.onMembershipAdvanced(conversationId, [], [target]);
+      this.deps.pushEvent('membership-stalled', { conversationId, kind: 'remove' });
     });
     this.pendingOps.set(conversationId, { kind: 'remove', handle });
   }
@@ -1270,24 +1500,26 @@ export class GroupChannel {
     }
     t.publish({ messageId: randomBytes(16), routingKey: oldMailbox, payload: staged.commit, ttlSeconds: SEVEN_DAYS });
     t.publish({ messageId: randomBytes(16), routingKey: target.deviceKey, payload: staged.welcome, ttlSeconds: SEVEN_DAYS });
-    // Backstop: if no echo and no competing commit arrive, confirm the still-pending add (idempotent)
-    // and advance. A competing commit that wins is auto-aborted inside receive and clears this
-    // conversation's pendingAdd via onGroupMessage before this fires, so this only runs for an
-    // uncontested add whose echo was lost.
+    // A wall clock is NOT evidence that anyone received this commit. Merging on a timeout is what
+    // put a device onto a private key period of its own: the commit was dropped (a rate limit, a
+    // pacing drop, a gateway restart), nobody else ever saw it, and this device advanced alone and
+    // could no longer read the conversation. So the timer no longer merges. It only gives up on the
+    // staged commit and reports that the membership change did not take, which is recoverable (try
+    // again) where a silent fork was not.
     const handle = this.deps.schedule(ADD_CONFIRM_MS, () => {
       if (this.connectGen !== armedGen || !this.pendingOps.has(conversationId)) {
         return; // a reconnect superseded this backstop, or it was already resolved
       }
       this.pendingOps.delete(conversationId);
       if (entry.session.pendingKind() === null) {
-        return; // an echo or a competing commit already resolved the add: nothing to confirm or announce
+        return; // an echo or a competing commit already resolved the add: nothing to abandon
       }
       try {
-        entry.session.confirmAdd();
+        entry.session.abortAdd(); // stay on the epoch every other member is still on
       } catch {
         return;
       }
-      void this.onMembershipAdvanced(conversationId, [target.deviceKey], []);
+      this.deps.pushEvent('membership-stalled', { conversationId, kind: 'add' });
     });
     this.pendingOps.set(conversationId, { kind: 'add', target, handle });
   }
@@ -1326,7 +1558,7 @@ export class GroupChannel {
     // never publishes the contact graph.
     this.publishBuddiesFor(entry.session);
     this.publishGroupsFor(entry.session);
-    return sealed;
+    return sealed.then(() => undefined); // callers await durability here, not the seal's verdict
   }
 
   /** P6: remove a device from the group, rotating the group secrets so it cannot read future messages
@@ -1399,12 +1631,74 @@ export class GroupChannel {
     await this.resealSelf();
   }
 
+  /** ADR-022 P7: mint a signed revocation record naming `deviceSigKeyHex`, adopt it here, and return it
+   * as hex for the caller to publish. Seed-holder only; returns null when this device holds no account
+   * key (a cert-only device can revoke server-side but cannot author the durable record). Re-seals, so
+   * the denylist survives a reload even if publishing the record then fails. */
+  async revokeDeviceKey(deviceSigKeyHex: string, issuedSeq: number): Promise<string | null> {
+    const conv = this.requireConv();
+    if (conv.revokeDevice === undefined || conv.accountKeyHex() === '') {
+      return null;
+    }
+    const record = conv.revokeDevice(deviceSigKeyHex, issuedSeq);
+    await this.resealSelf();
+    return record;
+  }
+
+  /** ADR-022 P7: accept revocation records fetched from the control plane. Each is verified against our
+   * OWN account key inside the crypto layer, so a record that does not check out is DISCARDED rather
+   * than stored: a hostile control plane can withhold records (costing liveness) but cannot inject one.
+   * Returns how many were new; re-seals only when something changed, since this runs on every sync. */
+  async ingestRevocations(records: readonly string[]): Promise<number> {
+    const conv = this.conv;
+    if (conv === null || conv.ingestRevocation === undefined || records.length === 0) {
+      return 0;
+    }
+    let added = 0;
+    for (const record of records) {
+      try {
+        if (conv.ingestRevocation(record)) {
+          added++;
+        }
+      } catch {
+        // A record that does not verify under our account key. Skipping it is the fail-closed choice:
+        // it never enters the denylist, and the rest of the batch is still honored.
+      }
+    }
+    if (added > 0) {
+      await this.resealSelf();
+    }
+    return added;
+  }
+
+  /** How many revocation records this device holds (the DERIVED epoch), and the lowest cert epoch it
+   * will now certify at. Both are plain counters, exposed so a stuck pairing can be diagnosed by
+   * reading the numbers instead of inferring them from a rejection. */
+  revocationState(): { revoked: number; floor: number } {
+    const conv = this.conv;
+    return {
+      revoked: conv?.revokedCount?.() ?? 0,
+      floor: conv?.accountFloor?.() ?? 0,
+    };
+  }
+
+  /** Whether we hold a verifying revocation record for `deviceSigKeyHex`. Used to decide whether a
+   * device the server already shows as revoked still needs a record minted for it (accounts revoked
+   * devices before P7 existed, and those tombstones carry no record). */
+  isDeviceRevoked(deviceSigKeyHex: string): boolean {
+    return this.conv?.isDeviceRevoked?.(deviceSigKeyHex) ?? false;
+  }
+
   /** P6 epoch sync: bring this device up to the account's current cert epoch. A seed-holder behind the
    * epoch re-certifies and re-seals (returns ready); a seedless device that cannot self-certify and is
    * behind is stale (returns not-ready, so the app declines to publish its key packages and prompts a
    * reconnect). A device already at or above the epoch is ready. */
   async syncEpoch(certEpoch: number): Promise<{ ready: boolean; stale: boolean }> {
     const conv = this.conv;
+    // Remember the account epoch the app just read from the directory, so mintEpoch can certify a NEW
+    // device at it. Monotonic, mirroring the crypto floor: a later call that reports a lower number
+    // (a transient listDevices failure returns 0) must never walk the mint back down under the floor.
+    this.lastAccountEpoch = Math.max(this.lastAccountEpoch, certEpoch);
     if (conv === null) {
       return { ready: false, stale: false };
     }
@@ -1433,21 +1727,32 @@ export class GroupChannel {
   /** Mint `n` fresh one-time key packages to publish to the directory, so peers (and our own future
    * devices) can add this device to a group. Each carries the CURRENT credential, so after a provisioned
    * device adopts its certificate these packages are authorized and pass the gate at peers. */
-  freshKeyPackages(n: number): Uint8Array[] {
+  async freshKeyPackages(n: number): Promise<Uint8Array[]> {
     const conv = this.requireConv();
     // Mint-time guard: a SEED-HOLDER must never mint label-only packages (they become certless roster
     // leaves nothing can ever repair, the ghost-channel origin). Self-heal by re-certifying at the
-    // current epoch before minting; the reseal is fire-and-forget (the credential change is in-memory
-    // for these packages either way, and the next reseal point persists it).
+    // current epoch before minting; the single awaited reseal below persists the credential change too.
     if (conv.accountKeyHex() !== '' && !(conv.credentialCertified?.() ?? true)) {
       conv.reauthorizeAtEpoch(conv.certEpoch());
-      void this.resealSelf().catch(() => {
-        /* best-effort persistence; re-runs on the next mint or epoch sync */
-      });
     }
     const out: Uint8Array[] = [];
-    for (let i = 0; i < n; i++) {
+    for (let i = 0; i < n - 1; i++) {
       out.push(conv.keyPackage());
+    }
+    // The LAST package becomes the directory's last-resort row (app.ts publishOwnKeys splits it off),
+    // and that row is re-served after the one-time packages drain. It must carry the MLS LastResort
+    // extension or OpenMLS deletes its private bundle on the first join, making every later claim a
+    // Welcome nobody can open. Falls back to a one-time package on an older wasm build.
+    if (n > 0) {
+      out.push(conv.keyPackageLastResort?.() ?? conv.keyPackage());
+    }
+    // A key package's private half lives ONLY in the wasm provider's storage map until a reseal writes
+    // it down, and the sealed blob IS that map. Seal BEFORE the caller publishes the public halves, and
+    // FAIL CLOSED if the vault could not be sealed: a published package whose private half dies on the
+    // next reload is advertised as fresh by the directory forever, and the Welcome a sibling seals to
+    // it fails with NoMatchingKeyPackage at the recipient. That is the self-group split (2026-08-01).
+    if (!(await this.resealSelf())) {
+      throw new Error('cannot mint key packages: this device could not seal its private keys');
     }
     return out;
   }
@@ -1489,6 +1794,10 @@ export class GroupChannel {
       provisionSeal: psl ? (r, p) => psl(r, p) : undefined,
       provisionOpen: pop ? (s, b) => pop(s, b) : undefined,
       authorizeScannedDevice: (k, e) => this.requireConv().authorizeScannedDevice(k, e),
+      // The epoch a NEW device's certificate is minted at. Take the HIGHER of what the directory last
+      // reported and our own certificate's epoch: below either one the crypto gate refuses the new
+      // device's leaf forever ("certificate epoch below floor"), and the floor only ever rises.
+      mintEpoch: () => Math.max(this.lastAccountEpoch, this.requireConv().certEpoch()),
     };
     this.provisioning = new Provisioning(deps);
     return this.provisioning;
@@ -1507,12 +1816,90 @@ export class GroupChannel {
     this.deps.pushEvent(kind, payload);
   }
 
-  private async resealSelf(): Promise<void> {
-    if (this.conv !== null && this.persistence !== undefined) {
-      await this.persistence.resealSelf(this.conv).catch(() => {
-        /* best-effort; a locked vault must not break an in-progress join */
+  /** Record a Welcome we just published, so a bus that loses it (restart, crash, TTL) is not the only
+   * copy. Best-effort: a store that cannot write must never break an in-progress mint. */
+  private async rememberWelcome(conversationId: string, deviceKey: string, welcome: Uint8Array): Promise<void> {
+    if (this.persistence?.saveWelcomeOutbox === undefined) {
+      return;
+    }
+    await this.loadWelcomeOutbox();
+    this.welcomeOutbox = [
+      ...this.welcomeOutbox.filter((e) => !(e.conversationId === conversationId && e.deviceKey === deviceKey)),
+      { conversationId, deviceKey, welcomeHex: bytesToHex(welcome), createdAt: Date.now() },
+    ];
+    await this.persistence.saveWelcomeOutbox(this.welcomeOutbox).catch(() => {
+      /* best-effort durability; the in-memory copy still covers this session */
+    });
+  }
+
+  /** Retire every pending Welcome for a conversation. Called when a frame we did NOT author arrives in
+   * it: that is PROOF a sibling actually joined, which roster membership is not (the adder asserts the
+   * roster unilaterally, which is exactly why every self-heal predicate read "complete" while the
+   * account was split). With 3+ own devices one sibling's liveness retires the whole conversation's
+   * entries; a device that still missed its Welcome is then covered by the staged-add reconcile heal. */
+  private async retireWelcomes(conversationId: string): Promise<void> {
+    if (this.persistence?.saveWelcomeOutbox === undefined || this.welcomeOutbox.length === 0) {
+      return;
+    }
+    const kept = this.welcomeOutbox.filter((e) => e.conversationId !== conversationId);
+    if (kept.length === this.welcomeOutbox.length) {
+      return;
+    }
+    this.welcomeOutbox = kept;
+    await this.persistence.saveWelcomeOutbox(kept).catch(() => {
+      /* best-effort */
+    });
+  }
+
+  private async loadWelcomeOutbox(): Promise<void> {
+    if (this.welcomeOutboxLoaded || this.persistence?.loadWelcomeOutbox === undefined) {
+      return;
+    }
+    this.welcomeOutboxLoaded = true;
+    this.welcomeOutbox = await this.persistence.loadWelcomeOutbox().catch(() => []);
+  }
+
+  /** Re-publish every pending Welcome on reconnect. A resent Welcome for a group the recipient already
+   * holds is rejected as `already a member of this group`, which onWelcome acks as permanent — so the
+   * retry is idempotent and self-cleaning at the receiver even when our liveness signal never arrives.
+   * Entries older than the intended delivery window are dropped so the outbox cannot grow without end. */
+  private async replayWelcomeOutbox(): Promise<void> {
+    await this.loadWelcomeOutbox();
+    const t = this.transport;
+    if (t === null || this.welcomeOutbox.length === 0) {
+      return;
+    }
+    const cutoff = Date.now() - WELCOME_OUTBOX_TTL_MS;
+    const live = this.welcomeOutbox.filter((e) => e.createdAt >= cutoff);
+    for (const e of live) {
+      try {
+        t.publish({ messageId: randomBytes(16), routingKey: e.deviceKey, payload: hexToBytes(e.welcomeHex), ttlSeconds: WELCOME_TTL_SECONDS });
+      } catch {
+        /* a closed socket: the next reconnect replays this entry again */
+      }
+    }
+    if (live.length !== this.welcomeOutbox.length) {
+      this.welcomeOutbox = live;
+      await this.persistence?.saveWelcomeOutbox?.(live).catch(() => {
+        /* best-effort */
       });
     }
+  }
+
+  private async resealSelf(): Promise<boolean> {
+    if (this.conv === null) {
+      return false;
+    }
+    if (this.persistence === undefined) {
+      // No durable store wired at all (the degraded main-thread fallback): there is nothing to seal
+      // and nothing survives a reload anyway, so this is not the "seal failed" case the callers guard
+      // against — that one is a store that EXISTS but could not write (a locked vault, a full disk).
+      return true;
+    }
+    return this.persistence.resealSelf(this.conv).catch(() => {
+      /* best-effort; a locked vault must not break an in-progress join */
+      return false;
+    });
   }
 
   /** Handlers stamped with the connect generation that created them: once a newer connectGateway has
@@ -1590,16 +1977,30 @@ export class GroupChannel {
     if (conv === null || t === null) {
       return;
     }
+    this.welcomesSeen += 1;
     let session: GroupSession;
     try {
       // Join creates the group slot in the wasm and yields its (stable) group id. A duplicate/resent
       // Welcome for a conversation we already hold makes the wasm reject the join (group-id collision);
       // we ack and drop it, never clobbering the existing conversation (Welcome-storm safe).
       session = GroupSession.join(conv, env.payload);
-    } catch {
-      t.ack(env.messageId);
+    } catch (e) {
+      // ACK ONLY WHAT IS PERMANENTLY UNPROCESSABLE — the same discipline onGroupMessage follows below
+      // (ack the POISON_DROP_PREFIX cases, let transient ones redeliver). An ack tells the bus this
+      // blob is PROCESSED and destroys the only copy; a bare catch-and-ack here silently threw away
+      // every recoverable failure too (a not-yet-restored vault, a storage hiccup, a key package whose
+      // private half the sender can still re-seal and re-issue), which is how the self-group split
+      // became permanent and invisible. Anything else now redelivers on the next re-subscribe and,
+      // either way, surfaces an error instead of vanishing.
+      const detail = errMsg(e);
+      this.lastWelcomeError = detail;
+      if (isPermanentWelcomeFailure(detail)) {
+        t.ack(env.messageId);
+      }
+      this.deps.pushEvent('error', { code: -1, detail: `welcome: ${detail}` });
       return;
     }
+    this.welcomesJoined += 1;
     const conversationId = this.convId(session.groupId);
     if (this.sessions.has(conversationId)) {
       t.ack(env.messageId); // already joined (belt-and-suspenders alongside the wasm collision guard)
@@ -1686,6 +2087,12 @@ export class GroupChannel {
       t.ack(env.messageId); // a message for a conversation we do not (locally) hold: drop it
       return;
     }
+    // PROOF OF LIVENESS. Our own echo never reaches here (receiveGroup throws OWN_ECHO_DROP_PREFIX and
+    // returns above), so a frame at this point was authored by somebody else in this conversation —
+    // i.e. a sibling really did join. That, not roster membership, is what retires a pending Welcome:
+    // the roster is asserted unilaterally by the adder, which is precisely why every self-heal
+    // predicate reported "complete" on the minter while the account was actually split in two.
+    void this.retireWelcomes(conversationId);
     const received = routed.received;
     if (received.type === 'membership') {
       // A staged add we were waiting on in THIS conversation just resolved: either our own commit was
@@ -1776,6 +2183,9 @@ export class GroupChannel {
       .then(() => {
         t.ack(env.messageId);
         this.deps.pushEvent('inbound-message', { conversationId });
+        // The plaintext is now stored under its own per-message key, so the MLS ratchet that produced
+        // it has no further use to us: push the stored ratchet past it.
+        this.scheduleRatchetFlush(conversationId);
       })
       .catch((e) => {
         this.deps.pushEvent('error', { code: -1, detail: errMsg(e) });
@@ -1821,6 +2231,15 @@ export class GroupChannel {
 }
 
 const SEVEN_DAYS = 604800;
+// The gateway CLAMPS any requested TTL to MaxTTL = 24h (gateway/internal/bus/bus.go) and tells the
+// publisher nothing, so asking for SEVEN_DAYS bought a week of delivery slack we never actually had —
+// a sibling offline for two days silently lost its Welcome. Ask for what the bus will really honour,
+// and let the durable outbox (not a hopeful TTL) cover a recipient that stays away longer than that.
+const GATEWAY_MAX_TTL_SECONDS = 86400;
+const WELCOME_TTL_SECONDS = GATEWAY_MAX_TTL_SECONDS;
+// How long the SENDER keeps re-publishing an unacknowledged Welcome across reconnects. This is the real
+// delivery window now: it spans gateway restarts and crashes, which the bus TTL never could.
+const WELCOME_OUTBOX_TTL_MS = SEVEN_DAYS * 1000;
 const PROV_TTL = 600; // provisioning frames are control-plane and short-lived (10 min backstop)
 // How long a revoke waits for its gateway receipt before rejecting (the sender keeps its copy and can
 // retry). One gateway round trip in practice; generous for real-network latency, like the backstops below.
@@ -1834,7 +2253,35 @@ const POISON_DROP_PREFIX = 'drop:';
 // The crypto marks a bus echo of OUR OWN publish with this sub-prefix (see conversation.rs
 // process_in_slot): acked and silenced, never surfaced as an error event.
 const OWN_ECHO_DROP_PREFIX = POISON_DROP_PREFIX + 'own frame';
-const ADD_CONFIRM_MS = 8000; // confirm an uncontested staged add if its echo never arrives
+// A Welcome we can NEVER process, no matter how often the bus redelivers it: bytes that are not a
+// Welcome at all, and a Welcome for a group we already hold (a resent/duplicate founding Welcome —
+// acking it is what keeps a Welcome storm from pinning the mailbox). Everything else — notably
+// `process welcome: ... NoMatchingKeyPackage`, whose sender can re-issue against a fresh package —
+// is left unacked so it redelivers, bounded by the bus TTL. Mirrors the wasm error strings in
+// join_from_welcome_inner (crypto/src/conversation.rs).
+const PERMANENT_WELCOME_FAILURES = ['already a member of this group', 'parse welcome:', 'expected a Welcome message'];
+function isPermanentWelcomeFailure(detail: string): boolean {
+  return detail.startsWith(POISON_DROP_PREFIX) || PERMANENT_WELCOME_FAILURES.some((m) => detail.includes(m));
+}
+
+// The raw wasm error is a debug-formatted OpenMLS enum chain, far too long for a one-line subtitle on a
+// phone. Surface the discriminating token when we recognize it, else a short prefix.
+const WELCOME_ERROR_MARKERS = [
+  'NoMatchingKeyPackage',
+  'NoMatchingEncryptionKey',
+  'already a member of this group',
+  'UnsupportedExtension',
+];
+function shortWelcomeError(detail: string): string {
+  return WELCOME_ERROR_MARKERS.find((m) => detail.includes(m)) ?? detail.slice(0, 40);
+}
+// How long inbound traffic must settle before the receive ratchets are flushed and the container is
+// re-sealed ONCE for every conversation that had traffic. Long enough that a busy account is not
+// re-sealing constantly (the seal is O(conversations) in both CPU and bytes written), short enough that
+// the window in which a just-read message is still recoverable from disk is seconds rather than the life
+// of the key period.
+const RATCHET_FLUSH_MS = 15000;
+const ADD_CONFIRM_MS = 8000; // ABANDON an uncontested staged commit whose echo never arrives (never merge it)
 // The post-restore confirm backstop is deliberately LONGER: right after a reload the gateway may still be
 // re-delivering a rival commit that won the epoch while we were down; give it time to arrive (and abort
 // our restored pending) before we would force-merge our own commit onto a possibly-stale epoch.

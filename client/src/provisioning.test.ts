@@ -109,7 +109,7 @@ describe('Provisioning orchestration (two-leg handshake)', () => {
     let d1: Provisioning;
     // eslint-disable-next-line prefer-const
     let d2: Provisioning;
-    const base = (random: (n: number) => Uint8Array): Pick<ProvisioningDeps, 'publish' | 'ack' | 'sasDigestHex' | 'renderSas' | 'random' | 'schedule' | 'cancel'> => ({
+    const base = (random: (n: number) => Uint8Array): Pick<ProvisioningDeps, 'publish' | 'ack' | 'sasDigestHex' | 'renderSas' | 'random' | 'schedule' | 'cancel' | 'mintEpoch'> => ({
       publish: pub,
       ack: () => {},
       sasDigestHex: fakeSas,
@@ -117,6 +117,7 @@ describe('Provisioning orchestration (two-leg handshake)', () => {
       random,
       schedule: () => 0,
       cancel: () => {},
+      mintEpoch: () => 0,
     });
     const d1deps: ProvisioningDeps = {
       ...base(rnd),
@@ -234,7 +235,7 @@ describe('QR pairing (add-a-device-by-scan)', () => {
   // byte-complement of its secret, and the "box" records the recipient public key ahead of the plaintext,
   // so open() succeeds only for the holder of the matching secret. This proves the ORCHESTRATION (mailbox
   // derivation, certify, seal, publish, receive, open, adopt), not the crypto, which Rust already covers.
-  function qrHarness() {
+  function qrHarness(accountEpoch = 0) {
     const bus = new Map<string, Array<(env: ProvFrame) => void>>();
     const sub = (key: string, h: (env: ProvFrame) => void): void => {
       const a = bus.get(key) ?? [];
@@ -283,13 +284,14 @@ describe('QR pairing (add-a-device-by-scan)', () => {
     let d1: Provisioning;
     // eslint-disable-next-line prefer-const
     let d2: Provisioning;
-    const base = (): Pick<ProvisioningDeps, 'publish' | 'sasDigestHex' | 'renderSas' | 'random' | 'schedule' | 'cancel'> => ({
+    const base = (): Pick<ProvisioningDeps, 'publish' | 'sasDigestHex' | 'renderSas' | 'random' | 'schedule' | 'cancel' | 'mintEpoch'> => ({
       publish: pub,
       sasDigestHex: fakeSas,
       renderSas: (d) => renderSas(hexToBytes(d)),
       random: (n) => fill(n, 5),
       schedule: () => 0,
       cancel: () => {},
+      mintEpoch: () => accountEpoch,
     });
     const d1deps: ProvisioningDeps = {
       ...base(),
@@ -359,6 +361,21 @@ describe('QR pairing (add-a-device-by-scan)', () => {
     expect(h.d1ev.some((e) => e.k === 'device-added')).toBe(true);
     expect(h.adopted).toEqual({ ap: 'a1'.repeat(32), ep: 0, c: 'cc'.repeat(64) });
     expect(h.acked).toBe(true);
+    expect(h.d2ev.some((e) => e.k === 'provisioning-authorized')).toBe(true);
+  });
+
+  it('certifies a scanned device at the ACCOUNT epoch, not 0, so the new leaf clears the floor', async () => {
+    // The bug this pins: the minted epoch was the literal 0. The account's authorization floor is the
+    // number of devices it has ever revoked, and the crypto gate refuses any leaf below that floor. So
+    // on any account that had revoked even once, every scanned device was certified dead on arrival:
+    // the pairing reported success and the server row was created, but the add failed forever and the
+    // app told the user to revoke and pair again, which raised the floor and made it strictly worse.
+    const h = qrHarness(14); // an account with 14 revoked devices, exactly the reported case
+    const payload = await h.d2.startQrShow();
+    await h.d1.grantScanned(payload);
+
+    expect(h.scannedKey).toBe(D2KEY);
+    expect(h.adopted).toEqual({ ap: 'a1'.repeat(32), ep: 14, c: 'cc'.repeat(64) });
     expect(h.d2ev.some((e) => e.k === 'provisioning-authorized')).toBe(true);
   });
 

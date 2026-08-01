@@ -906,6 +906,60 @@ describe('AppControllerImpl (real storage-backed controller)', () => {
     expect((await ctrl2.listBuddies()).map((b) => b.username)).toEqual(['falcon']);
   });
 
+  it('carries a verified key through normalization only when it looks like a key', () => {
+    const K = 'ab'.repeat(32);
+    const m = normalizeBuddyMap({
+      raven: { addedAt: 1, v: 2, removed: false, group: 'Buddies', vk: K },
+      owl: { addedAt: 1, v: 2, removed: false, group: 'Buddies', vk: 'NOT-HEX' },
+      crow: { addedAt: 1, v: 2, removed: false, group: 'Buddies', vk: 'ab'.repeat(8) }, // too short
+    });
+    expect(m.raven?.vk).toBe(K);
+    expect(m.owl?.vk).toBeUndefined();
+    expect(m.crow?.vk).toBeUndefined();
+  });
+
+  it('adopts a sibling verification per-buddy LWW, and converges a same-version disagreement on one key', async () => {
+    const sessions = new SealedSessionStore(db);
+    let clock = 0;
+    const ctrl = new AppControllerImpl(vault, channels, keyvault, () => clock, undefined, undefined, sessions);
+    await ctrl.unlock('alice', 'pass');
+    clock = 10;
+    await ctrl.addBuddy('raven');
+    const K1 = '11'.repeat(32);
+    const K2 = 'ee'.repeat(32);
+    const frame = (buddies: Record<string, unknown>): Uint8Array => enc.encode(JSON.stringify({ buddies }));
+    // A sibling verified raven at v=20: the pin is adopted here too. This controller has no live
+    // group session, so the CURRENT key is unreadable and the honest badge is 'stale', never the
+    // green check: claiming 'verified' on unreadable data was the defect the security review caught.
+    await ctrl.adoptBuddies(frame({ raven: { addedAt: 1, v: 20, removed: false, group: 'Buddies', vk: K1 } }));
+    expect(await ctrl.buddyVerifyStates(['raven'])).toEqual({ raven: 'stale' });
+    expect((await ctrl.buddyVerifyInfo('raven')).state).toBe('stale');
+    // Same version, different key on two devices: both converge on the lexically larger key.
+    await ctrl.adoptBuddies(frame({ raven: { addedAt: 1, v: 20, removed: false, group: 'Buddies', vk: K2 } }));
+    const info = await ctrl.buddyVerifyInfo('raven');
+    expect(info.verifiedKey).toBe(K2);
+    // A NEWER record without a vk (an unverify, or an old client's write) clears it: plain LWW.
+    clock = 30;
+    await ctrl.adoptBuddies(frame({ raven: { addedAt: 1, v: 25, removed: false, group: 'Buddies' } }));
+    expect(await ctrl.buddyVerifyStates(['raven'])).toEqual({}); // no pin at all: no badge
+  });
+
+  it('refuses to pin a verification blind: no live conversation means no mark, and clear is idempotent', async () => {
+    const sessions = new SealedSessionStore(db);
+    const ctrl = new AppControllerImpl(vault, channels, keyvault, () => 50, undefined, undefined, sessions);
+    await ctrl.unlock('alice', 'pass');
+    await ctrl.addBuddy('raven');
+    // No groupChannel here, so the buddy's CURRENT key is unreadable: a mark must refuse rather than
+    // pin whatever a stale panel carried.
+    expect(await ctrl.markBuddyVerified('raven', 'ab'.repeat(32))).toBe(false);
+    expect(await ctrl.markBuddyVerified('raven', 'not hex')).toBe(false);
+    // A panel rendered against a prior pin that no longer matches must not commit either.
+    expect(await ctrl.markBuddyVerified('raven', 'ab'.repeat(32), 'cd'.repeat(32))).toBe(false);
+    expect((await ctrl.buddyVerifyInfo('raven')).state).toBe('unavailable');
+    await ctrl.clearBuddyVerified('raven'); // nothing pinned: a no-op, never a throw
+    expect(await ctrl.buddyVerifyStates(['raven'])).toEqual({});
+  });
+
   it('resolves a same-version add-vs-remove tie deterministically (removal wins), so presence converges', async () => {
     const sessions = new SealedSessionStore(db);
     let clock = 0;

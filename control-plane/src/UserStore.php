@@ -24,10 +24,61 @@ final class UserStore
     private const int TAKE_WINDOW = 60; // seconds: the fixed rate window for cross-user key-package claims
     private const int TAKE_MAX_PER_WINDOW = 30; // claims per caller->target per window (well above legit use)
     private const int ORPHAN_GRACE = 600; // seconds an enrolled-but-never-authorized device row may linger before reaping
+    private const int PROBE_WINDOW = 60; // seconds: the fixed rate window for cross-user directory probes
+    /**
+     * Cross-user directory probes (lookup + take-keys + away + presence) one caller may make per window,
+     * counted against ONE shared budget so an attacker cannot get PROBE_MAX of each.
+     *
+     * SIZED AGAINST THE REAL CLIENT, not against a guess. An earlier cut used 120/minute on the
+     * assumption that presence is read "at most once per buddy per PRESENCE_TTL". It is not: the buddy
+     * watcher polls every 30 SECONDS (client/src/app.ts startBuddyWatch), which is 2 probes per buddy
+     * per minute, and every buddy-list open adds another full round. At 120 that meant a user with ~60
+     * buddies exhausted the budget from the timer alone, and because a denial is deliberately shaped
+     * like a miss, their live buddies silently read offline, opening a chat said "no user by that
+     * name", and pairing a new device stalled on SECURING with no error. A limiter that breaks the
+     * product is not a limiter, it is an outage. 1200/minute leaves room for ~600 buddies polled twice
+     * a minute plus interactive traffic, and still cuts a harvester by ~50x.
+     *
+     * This caps ONE ACCOUNT at 1,728,000/day (1200 x 1440), against roughly 86M unthrottled. State the bypass plainly:
+     * registration is free, unauthenticated, unthrottled, and accounts never expire, so an attacker
+     * restores any rate they like by minting accounts and rotating them. Measured, that is about 160ms
+     * of server Argon2 per account, so ~500 accounts (~80 seconds of one core, ONCE) buys back the old
+     * throughput permanently. This is a per-account ceiling, not a budget an attacker must keep paying.
+     * The missing piece is a per-source limit on register itself, which is NOT built here because this
+     * server deliberately never sees a client address (honest-limits item 11); adding one would trade a
+     * documented property for this one, and that is a decision to make openly rather than in passing.
+     *
+     * So: enumeration of a unique-username registry is structural (see the register() oracle). Rate
+     * limiting raises the floor and is the only mitigation available that does not require the server to
+     * learn who talks to whom. It is a cost increase, not a fix.
+     *
+     * If a future client ever polls presence per buddy on a timer, raise this ONLY after adding a
+     * batched presence endpoint that charges the budget per HASH rather than per request; charging per
+     * request would let a harvester buy back the whole gain with one big array.
+     */
+    private const int PROBE_MAX_PER_WINDOW = 1200;
+
+    /**
+     * Argon2id cost, pinned explicitly rather than inherited from PASSWORD_ARGON2_DEFAULT_*.
+     *
+     * These are the current PHP defaults, so nothing about existing hashes or login cost changes today.
+     * The point is that register()'s real hash and authenticate()'s dummy hash MUST be computed at
+     * identical cost: if a future PHP (or a php.ini) moved the defaults, one of those two call sites
+     * could pick up the new cost while stored hashes kept the old one, silently reopening the
+     * account-existence timing oracle the dummy-hash path exists to close.
+     */
+    private const array ARGON2_OPTIONS = [
+        'memory_cost' => 65536, // 64 MiB
+        'time_cost' => 4,
+        'threads' => 1,
+    ];
 
     public function __construct(
         private readonly PDO $pdo,
         private readonly int $now,
+        /** Proof-of-work difficulty in leading zero bits. Injectable so tests can exercise the whole
+         *  mechanism at a difficulty that runs in milliseconds; production uses the constant. */
+        private readonly int $powBits = self::POW_BITS,
     ) {
     }
 
@@ -35,13 +86,19 @@ final class UserStore
      * Create an account with its first device. Returns the new device id, or null if the username
      * hash is already taken. Atomic: an account never exists without at least one device.
      */
-    public function register(string $usernameHash, string $authSecret, string $deviceKey): ?string
+    public function register(string $usernameHash, string $authSecret, string $deviceKey, ?string $authSecretV2 = null): ?string
     {
-        $authHash = password_hash($authSecret, PASSWORD_ARGON2ID);
+        // A client that supplied the v2 secret is born migrated: its SIGN-INS then cost the server only a
+        // fast hash. Registration itself still pays one Argon2id, and cannot stop paying it: the v1 hash
+        // is what /api/add-device authenticates against, and what a client with no wasm falls back to.
+        // Dropping it would brick device enrollment, which is exactly the defect that shipped once.
+        $hasV2 = is_string($authSecretV2) && preg_match('/^[0-9a-f]{64}$/', $authSecretV2) === 1;
+        $authHash = password_hash($authSecret, PASSWORD_ARGON2ID, self::ARGON2_OPTIONS);
+        $v2 = $hasV2 ? self::verifierV2($authSecretV2) : null;
         $this->pdo->beginTransaction();
         try {
-            $stmt = $this->pdo->prepare('INSERT OR IGNORE INTO users (username_hash, auth_hash, created_at) VALUES (?, ?, ?)');
-            $stmt->execute([$usernameHash, $authHash, $this->now]);
+            $stmt = $this->pdo->prepare('INSERT OR IGNORE INTO users (username_hash, auth_hash, auth_v2, created_at) VALUES (?, ?, ?, ?)');
+            $stmt->execute([$usernameHash, $authHash, $v2, $this->now]);
             if ($stmt->rowCount() !== 1) {
                 $this->pdo->rollBack();
                 return null; // the username hash already exists
@@ -55,27 +112,213 @@ final class UserStore
         }
     }
 
-    /** A fixed Argon2id hash with the same cost params as register(), computed once per worker and
-     *  cached, so the account-not-found path can pay an identical verify cost without leaking timing. */
-    private static ?string $dummyAuthHash = null;
+    /** Registration proof of work: how long a challenge is valid, and how many leading zero bits a
+     *  solution needs.
+     *
+     *  16 bits, MEASURED not guessed. The browser solver awaits crypto.subtle.digest per candidate, which
+     *  costs far more than the hash itself; at 20 bits that measured ~16 SECONDS on fast hardware, which
+     *  is a broken registration experience, not a price. 16 bits is ~65k candidates, about a second in a
+     *  browser. Verification is one hash either way.
+     *
+     *  BE HONEST ABOUT THE LEDGER. This does NOT make registration cheap for the server: register still
+     *  writes the v1 Argon2id hash (~155 ms), which cannot be dropped because /api/add-device
+     *  authenticates with the v1 secret alone. A determined attacker solving in native code pays far less
+     *  than 155 ms per account, so the puzzle is a COST ON MINTING, not a favourable CPU trade for us.
+     *  What actually bounds registration flooding is the edge rule (infra/cloudflare). Anyone who raises
+     *  this constant should first move the client solver off crypto.subtle, or they will only hurt users. */
+    private const int POW_TTL = 300;
+    private const int POW_BITS = 16;
 
-    /** Verify a login or a device-enrollment proof. True only when the account exists and matches. */
-    public function authenticate(string $usernameHash, string $authSecret): bool
+    /**
+     * The stored form of a v2 auth secret: a plain SHA-256, on purpose.
+     *
+     * A slow hash here would be pointless work. The value being hashed is already the output of the
+     * client's Argon2id, so there is no low-entropy passphrase left to protect at this layer: guessing
+     * it means guessing a 256-bit value. The passphrase itself is protected exactly as well as before,
+     * by the client-side Argon2id an attacker must run per guess against a leaked database.
+     */
+    /** The fixed digest the account-not-found path verifies against, so a MISS costs exactly one
+     *  Argon2id, the same as a wrong-credential hit. Precomputed under ARGON2_OPTIONS. */
+    private const string DUMMY_AUTH_HASH = '$argon2id$v=19$m=65536,t=4,p=1$a244ZmNPSE9rUk93WkhwRw$5r5LKo2I63Rvv6DyCBU7e0YzAuWfLsLoEM8qgnodQ8U';
+
+    private static function verifierV2(string $authSecretV2): string
     {
-        $stmt = $this->pdo->prepare('SELECT auth_hash FROM users WHERE username_hash = ?');
-        $stmt->execute([$usernameHash]);
-        $row = $stmt->fetch();
-        $authHash = is_array($row) ? ($row['auth_hash'] ?? null) : null;
-        if (!is_string($authHash)) {
-            // Account does not exist. Still run one Argon2id verify against a fixed dummy hash (same
-            // cost params as register) so the response time does not reveal existence: without this,
-            // a missing account returns in microseconds while a real one pays tens of ms, an
-            // unauthenticated account-existence oracle over candidate username hashes. Result discarded.
-            self::$dummyAuthHash ??= password_hash('deaddrop-dummy-authsecret', PASSWORD_ARGON2ID);
-            password_verify($authSecret, self::$dummyAuthHash);
+        return hash('sha256', 'deaddrop-auth-v2' . "\x1f" . $authSecretV2);
+    }
+
+    // NO PER-ACCOUNT SIGN-IN LIMITER. Two cuts of one were tried and both were worse than the problem:
+    // refusing over budget let anyone who knew a handle hold its owner out of their account (and, because
+    // the vault unlock is gated on this call, out of their own device), and skipping only the expensive
+    // verify did the same to every account that has not yet migrated to the v2 verifier, which is all of
+    // them today. Bounding the CPU without either lockout or a timing tell needs a queue, not a refusal.
+    //
+    // What is left is the edge cap on /api/login per source (infra/cloudflare/auth-ratelimit.json) and
+    // the passphrase itself. Be precise about the rest, because an earlier version of this comment was
+    // not: the v2 secret costs an ATTACKER nothing. Nothing requires it, so a guesser simply omits it and
+    // falls through to v1, which is one SHA-256 (client/src/auth.ts) plus one server-side Argon2id per
+    // attempt. Measured at 34 sign-in attempts/s against one account on an 8-worker server, bounded by
+    // that Argon2id. v2 is a speedup for the HONEST client (~53x), not a barrier to a hostile one, and
+    // this endpoint still spends real CPU on every unauthenticated attempt. What it buys over the
+    // removed limiter is that the cost cannot be aimed at someone else's account.
+
+    /** The server-side MAC secret for proof-of-work challenges, minted once and reused. */
+    private function serverSecret(): string
+    {
+        $read = function (): ?string {
+            $stmt = $this->pdo->prepare('SELECT secret FROM server_secret WHERE id = 1');
+            $stmt->execute();
+            $row = $stmt->fetch();
+            $secret = is_array($row) ? ($row['secret'] ?? null) : null;
+            return is_string($secret) && $secret !== '' ? $secret : null;
+        };
+        $existing = $read();
+        if ($existing !== null) {
+            return $existing;
+        }
+        // Race-safe: INSERT OR IGNORE means a concurrent worker's secret wins, and we re-read to use it.
+        $fresh = bin2hex(random_bytes(32));
+        $this->pdo->prepare('INSERT OR IGNORE INTO server_secret (id, secret) VALUES (1, ?)')->execute([$fresh]);
+        return $read() ?? $fresh;
+    }
+
+    /** Issue a proof-of-work challenge: a random value plus an expiry, MAC'd so the server keeps no
+     *  per-challenge state until one is actually spent. */
+    /** @return array{challenge: string, expiresAt: int, mac: string, bits: int} */
+    public function issueChallenge(): array
+    {
+        $challenge = bin2hex(random_bytes(16));
+        $expiresAt = $this->now + self::POW_TTL;
+        return [
+            'challenge' => $challenge,
+            'expiresAt' => $expiresAt,
+            'mac' => hash_hmac('sha256', $challenge . '|' . $expiresAt, $this->serverSecret()),
+            'bits' => $this->powBits,
+        ];
+    }
+
+    /**
+     * Check a solved challenge and SPEND it. Verifying costs one HMAC plus one hash; producing the
+     * solution costs the client about 2^POW_BITS hashes. That asymmetry is the whole mechanism.
+     *
+     * Fails closed on any doubt: a bad MAC, an expired challenge, a wrong solution, a replay, or a
+     * database fault all return false.
+     */
+    public function spendChallenge(string $challenge, int $expiresAt, string $mac, string $nonce): bool
+    {
+        if (preg_match('/^[0-9a-f]{32}$/', $challenge) !== 1 || $expiresAt <= $this->now) {
             return false;
         }
-        return password_verify($authSecret, $authHash);
+        $want = hash_hmac('sha256', $challenge . '|' . $expiresAt, $this->serverSecret());
+        if (!hash_equals($want, $mac)) {
+            return false;
+        }
+        if (self::leadingZeroBits(hash('sha256', $challenge . "\x1f" . $nonce)) < $this->powBits) {
+            return false;
+        }
+        try {
+            $this->pdo->prepare('DELETE FROM pow_spent WHERE expires_at <= ?')->execute([$this->now]);
+            // The PRIMARY KEY is what makes a replay impossible: the second spend of one challenge
+            // cannot insert, so it cannot succeed.
+            $ins = $this->pdo->prepare('INSERT OR IGNORE INTO pow_spent (challenge, expires_at) VALUES (?, ?)');
+            $ins->execute([$challenge, $expiresAt]);
+            return $ins->rowCount() === 1;
+        } catch (Throwable $e) {
+            return false;
+        }
+    }
+
+    /** Leading zero BITS of a hex digest. */
+    private static function leadingZeroBits(string $hex): int
+    {
+        $bits = 0;
+        foreach (str_split($hex) as $ch) {
+            $v = (int) hexdec($ch);
+            if ($v === 0) {
+                $bits += 4;
+                continue;
+            }
+            $bits += $v >= 8 ? 0 : ($v >= 4 ? 1 : ($v >= 2 ? 2 : 3));
+            break;
+        }
+        return $bits;
+    }
+
+    /** Verify a login or a device-enrollment proof. True only when the account exists and matches. */
+    public function authenticate(string $usernameHash, string $authSecret, ?string $authSecretV2 = null): bool
+    {
+        $stmt = $this->pdo->prepare('SELECT auth_hash, auth_v2 FROM users WHERE username_hash = ?');
+        $stmt->execute([$usernameHash]);
+        $row = $stmt->fetch();
+        $authV2 = is_array($row) ? ($row['auth_v2'] ?? null) : null;
+        if (is_string($authV2) && $authV2 !== '' && is_string($authSecretV2)) {
+            // THE FAST PATH. The client already paid a memory-hard Argon2id to produce $authSecretV2, so
+            // the server only compares a hash of it: microseconds, not 64 MiB. Cracking a leaked database
+            // is as hard as before (an attacker still runs the client's Argon2id per guessed passphrase).
+            // What this does NOT do is stop an unauthenticated request from spending the server's CPU:
+            // the fast path is reachable only by a caller who already knows the passphrase, and a guesser
+            // just omits v2 and takes the v1 branch below, which pays a full Argon2id per attempt whether
+            // the account exists or not. This is a throughput win for honest sign-ins, not a DoS control.
+            //
+            // A FAST PATH, NEVER AN EXCLUSIVE ONE. An earlier cut returned from here whenever the row had
+            // a v2 verifier, even when the caller sent no v2 secret. That bricked every account:
+            // /api/add-device authenticates with the v1 secret only, so it 401'd forever, and the app
+            // refuses a sign-in whose device enrollment fails. It also made the documented no-wasm
+            // fallback a permanent lockout reported as "wrong passphrase". Both are why this now falls
+            // through to v1 instead of returning false.
+            if (hash_equals($authV2, self::verifierV2($authSecretV2))) {
+                return true;
+            }
+        }
+        $authHash = is_array($row) ? ($row['auth_hash'] ?? null) : null;
+        if (!is_string($authHash)) {
+            // Account does not exist. Run EXACTLY ONE Argon2id verify against a fixed digest, so a
+            // miss costs what a WRONG-CREDENTIAL HIT costs and the response time reveals nothing.
+            //
+            // An earlier cut mirrored the FAST path here instead, reasoning that a migrated account
+            // verifies with a cheap hash. That was wrong, and measurably so: the fast path only runs
+            // when the CALLER supplies a matching v2 secret, which an attacker never does. Every real
+            // account therefore fell through to Argon2 while every absent one answered in ~1ms, and a
+            // sweep separated them with non-overlapping distributions at ~130x. The cost to match is the
+            // one an ATTACKER pays, not the one a legitimate client pays.
+            //
+            // The digest is hardcoded because PHP statics do not survive a request: computing it lazily
+            // made every miss pay hash + verify against a hit's verify alone, a 2:1 leak of its own.
+            password_verify($authSecret, self::DUMMY_AUTH_HASH);
+            return false;
+        }
+        if (!password_verify($authSecret, $authHash)) {
+            return false;
+        }
+        // Migrate this account to the v2 verifier now that the client has proved it holds the passphrase
+        // and has supplied the Argon2id-derived secret. From here its sign-ins cost the server nothing.
+        // Best-effort for the same reason as the rehash below: a read-only database must never fail an
+        // otherwise valid sign-in, and the next successful login simply tries again.
+        if (is_string($authSecretV2) && preg_match('/^[0-9a-f]{64}$/', $authSecretV2) === 1) {
+            try {
+                // ONLY when there is no verifier yet. The v2 secret reaching here has NOT been checked
+                // against anything (we got in via v1), so overwriting an existing verifier would let a
+                // client with a broken or stale KDF replace a good one with a value of its choosing, and
+                // that value would then authenticate on the fast path. Migrate once, never re-migrate.
+                $this->pdo->prepare(
+                    "UPDATE users SET auth_v2 = ? WHERE username_hash = ? AND (auth_v2 IS NULL OR auth_v2 = '')"
+                )->execute([self::verifierV2($authSecretV2), $usernameHash]);
+            } catch (Throwable $e) {
+                // ignore: migrating must never fail an authentication
+            }
+        }
+        // Upgrade a hash stored under weaker (older) parameters, now that we have the secret in hand.
+        // Only ever reached AFTER a successful verify, so it adds no timing signal to a failed or
+        // nonexistent login. Best-effort: a read-only or busy database must never fail an otherwise
+        // valid sign-in, and the next successful login will simply try again.
+        try {
+            if (password_needs_rehash($authHash, PASSWORD_ARGON2ID, self::ARGON2_OPTIONS)) {
+                $this->pdo->prepare('UPDATE users SET auth_hash = ? WHERE username_hash = ?')
+                    ->execute([password_hash($authSecret, PASSWORD_ARGON2ID, self::ARGON2_OPTIONS), $usernameHash]);
+            }
+        } catch (Throwable $e) {
+            // ignore: rehashing must never fail an authentication
+        }
+        return true;
     }
 
     /**
@@ -157,6 +400,74 @@ final class UserStore
     }
 
     /**
+     * The account's authorization epoch: an explicit monotonic counter, incremented once per successful
+     * revocation. A new device's certificate MUST be minted at or above this, or every member refuses
+     * its leaf ("certificate epoch below floor"). An unknown account reads 0, which is the correct
+     * floor for an account that has never revoked anything.
+     */
+    public function accountEpoch(string $account): int
+    {
+        $stmt = $this->pdo->prepare('SELECT account_epoch FROM users WHERE username_hash = ?');
+        $stmt->execute([$account]);
+        $row = $stmt->fetch();
+        $epoch = is_array($row) ? ($row['account_epoch'] ?? null) : null;
+        return is_numeric($epoch) ? (int) $epoch : 0;
+    }
+
+    /**
+     * The maximum revocation records one account may store. A bound is needed because this table is the
+     * one place a client writes an opaque blob, but it can be generous: a record is only ever produced by
+     * revoking a real device, and 512 is far past any real account's lifetime of hardware.
+     */
+    private const MAX_REVOCATIONS = 512;
+
+    /**
+     * Store one ADR-022 P7 signed revocation record. The record is opaque here: this server holds no
+     * account key, so it can neither produce nor validate one beyond its shape, and every client
+     * re-verifies the signature under its own account key before honoring it. Idempotent by primary key.
+     *
+     * @return bool false when the record is malformed or the account is at its cap
+     */
+    public function addRevocation(string $account, string $record): bool
+    {
+        // Exactly the wire size of one record (140 bytes as hex), lowercase hex only. Anything else is
+        // not a record this server has any business storing.
+        if (preg_match('/^[0-9a-f]{280}$/', $record) !== 1) {
+            return false;
+        }
+        $count = $this->pdo->prepare('SELECT COUNT(*) FROM device_revocations WHERE account = ?');
+        $count->execute([$account]);
+        if ((int) $count->fetchColumn() >= self::MAX_REVOCATIONS) {
+            return false;
+        }
+        $ins = $this->pdo->prepare(
+            'INSERT OR IGNORE INTO device_revocations (record, account, created_at) VALUES (?, ?, ?)'
+        );
+        $ins->execute([$record, $account, $this->now]);
+        return true;
+    }
+
+    /**
+     * Every revocation record on this account, oldest first. Returned verbatim; the client verifies.
+     *
+     * @return list<string>
+     */
+    public function listRevocations(string $account): array
+    {
+        $stmt = $this->pdo->prepare(
+            'SELECT record FROM device_revocations WHERE account = ? ORDER BY created_at ASC, record ASC'
+        );
+        $stmt->execute([$account]);
+        $out = [];
+        foreach ($stmt->fetchAll() as $row) {
+            if (is_array($row) && is_string($row['record'] ?? null)) {
+                $out[] = $row['record'];
+            }
+        }
+        return $out;
+    }
+
+    /**
      * Revoke a device on this account: burn its key and delete its live sessions. Idempotent.
      *
      * @return 'revoked'|'not_found' not_found when the device id is unknown or not on this account
@@ -171,8 +482,16 @@ final class UserStore
                 $this->pdo->commit();
                 return 'not_found';
             }
-            $this->pdo->prepare('UPDATE devices SET revoked_at = ? WHERE device_id = ? AND account = ? AND revoked_at IS NULL')
-                ->execute([$this->now, $deviceId, $account]);
+            $upd = $this->pdo->prepare('UPDATE devices SET revoked_at = ? WHERE device_id = ? AND account = ? AND revoked_at IS NULL');
+            $upd->execute([$this->now, $deviceId, $account]);
+            // Bump the account's epoch ONLY when this call actually transitioned a live device, so
+            // re-revoking an already-revoked device is idempotent rather than inflating the floor. The
+            // counter is authoritative and monotonic: it is never derived from the device rows, so
+            // pruning old tombstones (a history concern) can no longer walk a security floor backward.
+            if ($upd->rowCount() > 0) {
+                $this->pdo->prepare('UPDATE users SET account_epoch = account_epoch + 1 WHERE username_hash = ?')
+                    ->execute([$account]);
+            }
             $this->pdo->prepare('DELETE FROM sessions WHERE device_id = ?')->execute([$deviceId]);
             $this->pdo->prepare('DELETE FROM key_packages WHERE device_id = ?')->execute([$deviceId]);
             $this->pdo->commit();
@@ -239,6 +558,10 @@ final class UserStore
             $this->pdo->prepare('DELETE FROM devices WHERE account = ?')->execute([$account]);
             $this->pdo->prepare('DELETE FROM away WHERE account = ?')->execute([$account]);
             $this->pdo->prepare('DELETE FROM presence WHERE account = ?')->execute([$account]);
+            // The rate counters too: probe_rate says how much this account probed, and take_rate rows
+            // name (caller, target) pairs. Self destruct must not leave that behind.
+            $this->pdo->prepare('DELETE FROM probe_rate WHERE caller = ?')->execute([$account]);
+            $this->pdo->prepare('DELETE FROM take_rate WHERE caller = ? OR target = ?')->execute([$account, $account]);
             $this->pdo->prepare('DELETE FROM users WHERE username_hash = ?')->execute([$account]);
             $this->pdo->commit();
         } catch (Throwable $e) {
@@ -499,6 +822,82 @@ final class UserStore
              ON CONFLICT(caller, target) DO UPDATE SET window_start = excluded.window_start, count = 1'
         )->execute([$caller, $target, $windowStart]);
         return true;
+    }
+
+    /**
+     * Fixed-window rate limit on cross-user DIRECTORY PROBES: /api/lookup, /api/take-keys, /api/away and
+     * /api/presence all read state keyed by someone else''s username hash, and all four are pure SELECTs
+     * that cost the server nothing, so an unthrottled session can walk the username-hash space at
+     * thousands of probes per second. One shared per-caller budget (PROBE_MAX_PER_WINDOW per
+     * PROBE_WINDOW) bounds that walk. Mirrors allowTake''s shape, with two deliberate differences:
+     *
+     *  - NO target column. allowTake keys on (caller, target), which stores a contact-graph fragment at
+     *    rest; a probe counter must not, so it counts only how much a caller probed, never whom.
+     *  - It FAILS CLOSED. If the counter cannot be read or written we deny, because a database fault
+     *    that silently disabled the limiter is precisely the window a harvester wants. The caller then
+     *    sees the ordinary empty/miss response (see Api), so a fault is not distinguishable from a miss
+     *    either; the cost is that a database outage makes the directory read as empty rather than as an
+     *    error, which is the safe direction for this threat model.
+     *
+     * Returns true when the probe is allowed (and records it), false when the budget is exhausted.
+     * Callers MUST answer a false exactly as they answer a miss - never with 429 or a distinct body.
+     *
+     * What that buys, stated exactly: the throttle introduces NO NEW TARGET-EXISTENCE ORACLE. A denied
+     * probe carries no information about whether the target exists, so a harvester cannot turn the
+     * limiter itself into a faster directory.
+     *
+     * What it does NOT buy, so nobody builds on a false premise: an attacker still knows when they are
+     * throttled. The budget is a deterministic count of their OWN requests inside a fixed wall-clock
+     * window, so they can simply stop at the cap without probing anything. A denial is also measurably
+     * FASTER than an allowed miss (it short-circuits before both the counter write and the directory
+     * read), which is a timing tell on top of the arithmetic one. Their negatives are therefore not
+     * "unusable"; they are merely rate-limited.
+     */
+    public function allowProbe(string $caller): bool
+    {
+        $windowStart = $this->now - ($this->now % self::PROBE_WINDOW);
+        try {
+            $stmt = $this->pdo->prepare('SELECT window_start, count FROM probe_rate WHERE caller = ?');
+            $stmt->execute([$caller]);
+            $row = $stmt->fetch();
+            $rowWindow = is_array($row) && is_numeric($row['window_start'] ?? null) ? (int) $row['window_start'] : null;
+            $rowCount = is_array($row) && is_numeric($row['count'] ?? null) ? (int) $row['count'] : 0;
+            if ($rowWindow === $windowStart) {
+                if ($rowCount >= self::PROBE_MAX_PER_WINDOW) {
+                    return false; // this caller has spent its probe budget for the current window
+                }
+                $this->pdo->prepare('UPDATE probe_rate SET count = count + 1 WHERE caller = ?')->execute([$caller]);
+                return true;
+            }
+            // First probe in a new window (or the first ever): reset the counter to 1.
+            $this->pdo->prepare(
+                'INSERT INTO probe_rate (caller, window_start, count) VALUES (?, ?, 1)
+                 ON CONFLICT(caller) DO UPDATE SET window_start = excluded.window_start, count = 1'
+            )->execute([$caller, $windowStart]);
+            // Rolling into a new window happens at most once per caller per window, which makes it the
+            // cheapest place to hang the rate-table prune.
+            $this->pruneRateRows($windowStart);
+            return true;
+        } catch (Throwable $e) {
+            return false; // FAIL CLOSED: an unreadable counter denies rather than waving the probe through
+        }
+    }
+
+    /**
+     * Drop rate-counter rows from windows that can no longer allow or deny anything. Both limiters treat
+     * a row from an older window as "start a new window", so a stale row is already meaningless - but
+     * take_rate rows additionally pair a caller with a target, and keeping those forever would leave a
+     * durable record of who contacted whom on a server whose threat model (P2) says it stores no contact
+     * graph. Pruning bounds that residue to the current and previous window. Best-effort.
+     */
+    private function pruneRateRows(int $windowStart): void
+    {
+        try {
+            $this->pdo->prepare('DELETE FROM probe_rate WHERE window_start < ?')->execute([$windowStart - self::PROBE_WINDOW]);
+            $this->pdo->prepare('DELETE FROM take_rate WHERE window_start < ?')->execute([$windowStart - self::TAKE_WINDOW]);
+        } catch (Throwable $e) {
+            // ignore: hygiene must never fail a request
+        }
     }
 
     /**

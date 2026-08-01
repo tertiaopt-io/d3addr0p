@@ -126,7 +126,76 @@ final class Db
                 PRIMARY KEY (caller, target)
             )'
         );
+        // take_rate rows pair a caller with a target, which is a contact-graph fragment at rest (P2 says
+        // the server stores no contact graph). They are only meaningful for the current window, so they
+        // are pruned by window_start (UserStore::pruneRateRows); this index keeps that prune cheap.
+        $this->pdo->exec('CREATE INDEX IF NOT EXISTS idx_take_rate_window ON take_rate(window_start)');
+        // Fixed-window probe counter for cross-user directory reads (lookup / take-keys / away /
+        // presence): ONE row per CALLER, deliberately with NO target column, so the throttle itself can
+        // never become the contact graph the take_rate table accidentally is. See UserStore::allowProbe.
+        $this->pdo->exec(
+            'CREATE TABLE IF NOT EXISTS probe_rate (
+                caller       TEXT PRIMARY KEY,
+                window_start INTEGER NOT NULL,
+                count        INTEGER NOT NULL
+            )'
+        );
+        $this->pdo->exec('CREATE INDEX IF NOT EXISTS idx_probe_rate_window ON probe_rate(window_start)');
+        // Spent proof-of-work challenges, so one solution cannot be replayed into many registrations.
+        // Rows are pruned past their expiry; the table only ever holds one window of registrations.
+        $this->pdo->exec(
+            'CREATE TABLE IF NOT EXISTS pow_spent (
+                challenge  TEXT PRIMARY KEY,
+                expires_at INTEGER NOT NULL
+            )'
+        );
+        $this->pdo->exec('CREATE INDEX IF NOT EXISTS idx_pow_spent_exp ON pow_spent(expires_at)');
+        // The server-side secret that MACs a challenge, so the server keeps no per-challenge state.
+        // Generated once, on first use.
+        $this->pdo->exec('CREATE TABLE IF NOT EXISTS server_secret (id INTEGER PRIMARY KEY, secret TEXT NOT NULL)');
+        // ADR-022 P7: signed device revocation records. Each row is an OPAQUE blob signed by the
+        // account's authorization key, naming one revoked device signature key. This server is a
+        // dead drop for them and nothing more: it holds no account key, so it cannot forge a record,
+        // and every client re-verifies every record's signature before honoring it. Withholding rows
+        // is the only attack available here, and that costs liveness (a device stays admissible
+        // longer), never soundness.
+        //
+        // The PRIMARY KEY on the record itself makes re-posting idempotent, which matters because the
+        // client re-posts on every revoke retry.
+        $this->pdo->exec(
+            'CREATE TABLE IF NOT EXISTS device_revocations (
+                record     TEXT PRIMARY KEY,
+                account    TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )'
+        );
+        $this->pdo->exec('CREATE INDEX IF NOT EXISTS idx_revocations_account ON device_revocations(account)');
         $this->migrateLegacyIdentityKey();
+        // AFTER the legacy rebuild, which recreates `users` from a fixed column list and would otherwise
+        // drop this column again, 500-ing the request that follows on an old database.
+        // The v2 auth verifier: a FAST hash of a secret the client already derived with Argon2id. Nullable
+        // because existing accounts carry only the v1 (server-Argon2id) hash until their next sign-in.
+        $this->ensureColumn('users', 'auth_v2', 'TEXT');
+        // The account's authorization epoch: an EXPLICIT monotonic counter, bumped once per successful
+        // device revocation. It used to be derived by counting revoked device rows, which coupled a
+        // security floor to a history table: pruning old tombstones silently walked the epoch BACKWARD
+        // while every device's local floor stayed where it was (the floor only ever rises), so a newly
+        // paired device was certified below the floor and could never join. Backfilled from that count
+        // so no account's epoch moves at upgrade time; from here the two are independent.
+        $this->ensureColumn('users', 'account_epoch', 'INTEGER NOT NULL DEFAULT 0');
+        $this->backfillAccountEpoch();
+    }
+
+    /** Seed account_epoch from the historical revoked-row count, ONCE, for accounts still at 0. Skips
+     * any account already carrying a value, so it can never lower an epoch that has moved on. */
+    private function backfillAccountEpoch(): void
+    {
+        $this->pdo->exec(
+            'UPDATE users SET account_epoch = (
+                SELECT COUNT(*) FROM devices d
+                WHERE d.account = users.username_hash AND d.revoked_at IS NOT NULL
+             ) WHERE account_epoch = 0'
+        );
     }
 
     /** Add a column to a table if it is missing (for upgrading an existing database in place). */

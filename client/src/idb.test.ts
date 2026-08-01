@@ -64,6 +64,59 @@ describe('IndexedDbKeyvaultStore', () => {
     expect(await store.get('m1')).toBeUndefined();
     expect(await store.list()).toHaveLength(0);
   });
+
+  describe('history-off (ephemeral) mode', () => {
+    const msk = () => importMsk(new Uint8Array(32));
+    const rec = async (id: string, conv = 'c') =>
+      seal(
+        await msk(),
+        { messageId: id, conversationId: conv, direction: 'in', lifetime: { kind: 'duration', seconds: 30 } },
+        enc.encode(id),
+        0,
+      );
+
+    it('keeps new messages out of storage while still serving them to the open conversation', async () => {
+      const store = new IndexedDbKeyvaultStore(db);
+      store.setEphemeral(true);
+      await store.put(await rec('e1'));
+      // Readable through every path the UI uses, so the chat still renders.
+      expect((await store.get('e1'))?.messageId).toBe('e1');
+      expect(await store.listByConversation('c')).toHaveLength(1);
+      // But a fresh store over the SAME database sees nothing: nothing was written.
+      const fresh = new IndexedDbKeyvaultStore(db);
+      expect(await fresh.get('e1')).toBeUndefined();
+      expect(await fresh.list()).toHaveLength(0);
+    });
+
+    it('sends an update to a DISK-backed record back to disk, so a burn latch is never lost', async () => {
+      // The dangerous case: a record stored before the mode was turned on, then burned. If the
+      // tombstone went to memory, a reload would restore the readable original.
+      const store = new IndexedDbKeyvaultStore(db);
+      const original = await rec('d1');
+      await store.put(original); // durable, mode off
+      store.setEphemeral(true);
+      await store.put({ ...original, read: true }); // the burn latch writing its tombstone
+      const fresh = new IndexedDbKeyvaultStore(db);
+      expect((await fresh.get('d1'))?.read).toBe(true); // the latch survived, on disk
+    });
+
+    it('unions memory and disk, and leaving the mode drops what memory held', async () => {
+      const store = new IndexedDbKeyvaultStore(db);
+      await store.put(await rec('k1'));
+      store.setEphemeral(true);
+      await store.put(await rec('k2'));
+      expect(await store.listByConversation('c')).toHaveLength(2); // one of each
+      store.setEphemeral(false);
+      expect(await store.listByConversation('c')).toHaveLength(1); // the memory-held one is gone
+    });
+
+    it('purgeDurable crypto-erases what is already stored, which is what the toggle promises', async () => {
+      const store = new IndexedDbKeyvaultStore(db);
+      await store.put(await rec('p1'));
+      await store.purgeDurable();
+      expect(await new IndexedDbKeyvaultStore(db).list()).toHaveLength(0);
+    });
+  });
 });
 
 describe('SealedSessionStore', () => {
