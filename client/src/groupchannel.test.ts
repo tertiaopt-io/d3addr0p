@@ -1281,6 +1281,19 @@ describe('GroupChannel', () => {
     expect(phone.outbox).toHaveLength(0);
   });
 
+  it('a label-only seed-holder RE-CERTIFIES before minting a self-group, rather than being blocked', async () => {
+    // The wasm now refuses to mint a self-group from a label-only credential, because that freezes a
+    // certless leaf 0 no sibling can verify and nothing can repair. That gate must be a guard, not a
+    // dead end: a seed-holder can always re-certify itself, so the client heals first and mints second.
+    await ch.connectGateway('ws://x/ws');
+    conv.selfConversation = true;
+    conv.credentialCertifiedFlag = false; // a pre-P6 sealed blob restores exactly this
+    conv.reauthorized = 0;
+    await ch.createSelfGroup([{ deviceKey: hx('bb'), keyPackage: new Uint8Array([7]) }]);
+    expect(conv.reauthorized).toBe(1); // healed BEFORE the mint, so leaf 0 carries a certificate
+    expect(ch.hasSelfGroup()).toBe(true);
+  });
+
   it('an UNOPENABLE Welcome is acked once and the outbox stops replaying it (no publish loop)', async () => {
     // Observed live: a mobile client reported W1707/0 — 1707 Welcomes seen, none joined. Two of my own
     // changes multiplied together. NoMatchingKeyPackage was not on the permanent list, so a Welcome

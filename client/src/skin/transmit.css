@@ -89,7 +89,36 @@
   50% { opacity: 0.35; }
 }
 
-/* Peer identity line: name + verified key fingerprint (sealed-sender recognition). */
+/* TRUST BADGE STATES. The green pulsing block above is the healthy case. Colour is deliberately scarce:
+   a normal unverified contact gets NO colour and NO motion, because every conversation begins that way
+   and a permanent warning is one nobody reads. */
+.dd-tx-plain {
+  background: var(--dd-ink);
+  opacity: 0.45;
+  box-shadow: none;
+  animation: none; /* nothing is wrong; do not draw the eye */
+}
+.dd-tx-warn {
+  background: var(--dd-warn);
+  box-shadow: 0 0 7px rgba(255, 206, 94, 0.6);
+}
+/* A crypto-level fault: solid, static, unmissable. Static on purpose — the pulse reads as "working". */
+.dd-tx-bad {
+  background: var(--dd-danger);
+  box-shadow: 0 0 8px rgba(255, 107, 107, 0.75);
+  animation: none;
+}
+.dd-trust-bad {
+  color: var(--dd-danger);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+.dd-trust-warn {
+  color: var(--dd-warn);
+  font-weight: 700;
+}
+
+/* Peer identity line: name + verification state (never a key fingerprint — see renderTransmit). */
 .dd-sub {
   display: flex;
   justify-content: space-between;

@@ -50,6 +50,10 @@ export interface TransmitModel {
   readonly selfNote?: boolean; // the Note to Self view (own-devices self-group): hide peer-only controls
   // Self-group split diagnostic shown beside the group id: "<n> devices · W<seen>/<joined> · <error>".
   readonly selfDiag?: string;
+  // The header trust badge. Deliberately SEPARATE from `secure`, which gates typeability and is not a
+  // security predicate. Computed once in the controller so every surface agrees.
+  readonly trust?: 'offline' | 'insecure' | 'unreachable' | 'key-changed' | 'self' | 'verified' | 'unverified';
+  readonly trustNote?: string; // short, already-public reason (a classifier string, a device count)
   readonly peerHandle?: string | null; // the buddy handle this conversation was tagged with, when known
   readonly peerIsBuddy?: boolean; // whether that handle is already on the buddy list (hides Add Buddy)
   readonly verifyState?: BuddyVerifyInfo['state']; // contact verification for this conversation's peer
@@ -828,12 +832,53 @@ function renderEntry(e: LogEntry): string {
   );
 }
 
+/** The header trust badge, in precedence order. Colour is spent sparingly and on purpose:
+ *
+ *  - RED (insecure) only when the crypto itself reports a fault. Today that is exactly one thing: the
+ *    own-devices self-group failing classification for a non-benign reason — a roster member that
+ *    belongs to another account, or whose certificate will not verify, inside the group that carries
+ *    the contact graph and Note to Self.
+ *  - AMBER (key changed) for a pinned peer account key that positively changed. It is the MITM shape,
+ *    but a reinstall produces it too, so it is loud without being red.
+ *  - NEUTRAL (encrypted) for a normal unverified contact. Every conversation starts here; painting it
+ *    as a warning is how a warning stops being read.
+ *  - The unreachable case stays SECURE-with-a-qualifier: nothing can read what we send there, which is
+ *    a delivery failure, not a compromise. Calling it INSECURE would be a lie in the alarming direction.
+ */
+export function renderTrustBadge(m: TransmitModel): string {
+  const trust = m.trust ?? (m.secure ? 'unverified' : 'offline');
+  const note = (m.trustNote ?? '').trim();
+  const tail = note !== '' ? ` &middot; ${escapeHtml(note)}` : '';
+  if (trust === 'offline') {
+    return 'OFFLINE';
+  }
+  if (trust === 'insecure') {
+    return `<span class="dd-tx dd-tx-bad"></span><span class="dd-trust-bad">INSECURE${tail}</span>`;
+  }
+  if (trust === 'key-changed') {
+    return `<span class="dd-tx dd-tx-warn"></span><span class="dd-trust-warn">KEY CHANGED</span>`;
+  }
+  if (trust === 'unreachable') {
+    return `<span class="dd-tx"></span>SECURE &middot; <span class="dd-trust-warn">UNREACHABLE</span>`;
+  }
+  if (trust === 'self') {
+    return `<span class="dd-tx"></span>SECURE${tail}`;
+  }
+  if (trust === 'verified') {
+    return `<span class="dd-tx"></span>SECURE &check;`;
+  }
+  return `<span class="dd-tx dd-tx-plain"></span>ENCRYPTED${tail}`;
+}
+
 export function renderTransmit(m: TransmitModel): string {
   // Bind the compose toolbar's ⏳ pick to THIS conversation (see composeLifetimes).
   composeConvId = m.conversationId ?? '';
-  const secure = m.secure
-    ? '<span class="dd-tx"></span>SECURE'
-    : 'OFFLINE';
+  // THE TRUST BADGE. It used to be a two-way SECURE/OFFLINE readout of `m.secure`, which only ever meant
+  // "a channel summary decoded" — it said SECURE for a conversation whose peer key had provably changed,
+  // one line above a log entry saying the opposite. Red is reserved for a crypto-level fault so that it
+  // still means something when it appears; a normal unverified contact reads as ENCRYPTED, which is the
+  // true and unalarming statement (the traffic IS encrypted; we just cannot say who holds the far end).
+  const secure = renderTrustBadge(m);
   // Note to Self carries none of the peer controls: there is no one to view, call, or block, and adding
   // anyone is deliberately impossible so a peer can never be injected into the own-devices self-group
   // (that would turn it into a mixed group and leak the buddy list on the next sync). Just a quiet
@@ -855,8 +900,19 @@ export function renderTransmit(m: TransmitModel): string {
         selfTag !== '' ? ` &middot; group ${escapeHtml(selfTag)}` : ''
       }${selfDiag !== '' ? ` &middot; ${escapeHtml(selfDiag)}` : ''}</span></div>`
     : m.peer !== null
-      ? `<div class="dd-sub"><span>${escapeHtml(m.peer)}</span><span>${
-          m.fingerprint !== null ? `key ${escapeHtml(m.fingerprint)} &middot; verified` : 'unverified'
+      ? // The old line printed "verified" whenever a fingerprint existed at all — including for a peer
+        // whose key had CHANGED, directly above a log entry saying "this is not the key you verified".
+        // Worse, that fingerprint is OUR OWN device key (summary.fingerprint = fingerprintOf(bootstrapKey)),
+        // so it never identified the peer and was never a comparison target. Trust now lives in the badge
+        // and the Verify panel, which are the only places that actually know.
+        `<div class="dd-sub"><span>${escapeHtml(m.peer)}</span><span>${
+          m.verifyState === 'verified'
+            ? 'verified contact'
+            : m.verifyState === 'changed'
+              ? 'identity changed &middot; verify before trusting'
+              : m.verifyState === 'stale'
+                ? 'verified &middot; cannot re-check right now'
+                : 'not verified'
         }</span></div>`
       : '';
   const fileInput = m.secure ? '<input type="file" id="dd-file-input" hidden aria-hidden="true" />' : '';
@@ -4957,6 +5013,59 @@ export function mountApp(
     }
   }
 
+  /** Which desktop window, if any, is already DISPLAYING this conversation.
+   *
+   * "Displaying" is `activeConv`, not the window key. A chat shown in the two-pane Channels window has
+   * key `kind:channels`, so a key-only test (`conv:<id>`) misses it entirely — which is exactly how an
+   * inbound message opened a SECOND window for a conversation already on screen. purgeWindowsFor below
+   * already knows to look in all three places; this is the same predicate, reused for arrivals. */
+  function windowShowing(conversationId: string): 'live' | 'minimized' | 'parked' | null {
+    if (activeConv(view)?.id === conversationId) {
+      return 'live';
+    }
+    if (minimizedWins.some((m) => activeConv(m.view)?.id === conversationId)) {
+      return 'minimized';
+    }
+    if (parkedWins.some((p) => activeConv(p.view)?.id === conversationId)) {
+      return 'parked';
+    }
+    return null;
+  }
+
+  /** Whether the user is actively composing right now, so an arriving message must not yank the caret.
+   * Parked window bodies are inert, so `document.activeElement` is either inside the live window or the
+   * body itself — checking the live compose box is sound by construction. Text present OR a keystroke in
+   * the last few seconds both count: a just-cleared box mid-thought still deserves protection. */
+  function isTyping(): boolean {
+    const el = root.querySelector('#dd-compose-input');
+    if (!(el instanceof HTMLElement) || document.activeElement !== el) {
+      return false;
+    }
+    return serializeRichText(el).trim().length > 0 || Date.now() - lastTypedAt < TYPING_GRACE_MS;
+  }
+
+  /** Repaint the desktop WITHOUT destroying what the user is typing.
+   *
+   * render() rebuilds root.innerHTML, and a compose draft lives nowhere but that DOM node — so a repaint
+   * triggered by BACKGROUND news (an unread badge on a docked window, raising a parked one) silently
+   * erased the sentence in progress in the window the user was actually using. Harvest the draft into the
+   * view first, exactly as go() does when parking, and restore focus after. */
+  function repaintPreservingDraft(): void {
+    const liveCompose = root.querySelector('#dd-compose-input');
+    if (liveCompose instanceof HTMLElement) {
+      const draft = serializeRichText(liveCompose);
+      if (view.kind === 'conversation') {
+        view = { ...view, transmit: { ...view.transmit, compose: draft } };
+      } else if (view.kind === 'channels' && view.active !== undefined) {
+        view = { ...view, active: { ...view.active, compose: draft } };
+      }
+      if (document.activeElement === liveCompose) {
+        refocusComposeAfterRender = true;
+      }
+    }
+    render();
+  }
+
   /** Drop every window-stack copy of a conversation being closed for good, so nothing on the desktop
    * (a parked window, a menu-bar chip, a two-pane snapshot) can reopen the retired channel. */
   function purgeWindowsFor(conversationId: string): void {
@@ -4988,6 +5097,14 @@ export function mountApp(
   // Welcome never yanks the new device off the buddy list into a chat. Sliding: each suppressed heal
   // establish extends the window, so it self-tunes to the heal's real length rather than a fixed guess.
   let suppressAutoOpenUntil = 0;
+  // Conversations whose INSECURE warning the user has already acknowledged this session. Confirm-once,
+  // not confirm-always: a dialog on every message trains the reflex that dismisses it.
+  const insecureSendAcked = new Set<string>();
+  // When the user last pressed a key in the compose box. An arriving message must not raise a window
+  // over someone mid-sentence, and an empty box is not proof they stopped: this grace covers the pause
+  // between words and the moment just after a send.
+  const TYPING_GRACE_MS = 5000;
+  let lastTypedAt = 0;
   const POST_PROVISION_QUIET_MS = 4000;
   // A freshly-JOINED device gets a much longer auto-open quiet window: the seed-holder's self-group heal
   // is paced (3s polls over up to 120s), so the self-group Welcome can arrive minutes after Done, in the
@@ -6443,10 +6560,15 @@ export function mountApp(
     });
     // Enter sends the message; Shift+Enter inserts a newline (the compose is a rich contenteditable now).
     root.querySelector('#dd-compose-input')?.addEventListener('keydown', (e) => {
+      lastTypedAt = Date.now(); // an arriving message must not raise a window over someone mid-sentence
       if (e instanceof KeyboardEvent && e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
         root.querySelector('#dd-compose-form')?.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
       }
+    });
+    // keydown misses IME composition and paste, which are still very much "the user is typing".
+    root.querySelector('#dd-compose-input')?.addEventListener('input', () => {
+      lastTypedAt = Date.now();
     });
     root.querySelector('[data-action="send-file"]')?.addEventListener('click', () => {
       const inp = root.querySelector('#dd-file-input');
@@ -6528,6 +6650,15 @@ export function mountApp(
       }
       const typed = readRichEditor(root, 'dd-compose-input').trim();
       if (typed.length === 0) {
+        return;
+      }
+      // INSECURE means the crypto is reporting a fault in THIS conversation. Ask once per session before
+      // the first send into it, then stop — a prompt on every message is a prompt nobody reads. Only the
+      // red state gates: an unverified contact is normal, and an undeliverable one is a delivery problem.
+      const ac0 = activeConv(view);
+      if (ac0 !== null && ac0.transmit.trust === 'insecure' && !insecureSendAcked.has(ac0.id)) {
+        insecureSendAcked.add(ac0.id);
+        showToast('this conversation is flagged INSECURE · press Send again to send anyway');
         return;
       }
       // Apply "My Message Look" (AIM24): wrap the composed markers in the user's default font/color/size/
@@ -9527,23 +9658,42 @@ export function mountApp(
         //    only raised a toast sat unseen and its countdown never began.
         // Never steal focus during the pairing wizard, a modal/guided flow, or a transient editor holding
         // an unsaved draft: those windows own the screen and yanking the user out loses work.
-        const dockedKey = `conv:${p.conversationId}`;
-        const isDocked = minimizedWins.some((m) => m.key === dockedKey);
-        const popOk =
-          !isDocked &&
-          !joiningNewDevice &&
-          view.kind !== 'provisioning' &&
-          Date.now() >= suppressAutoOpenUntil &&
-          isPrimaryWindow(view); // a primary window (buddy list / channels / another chat) may be superseded
-        if (isDocked) {
-          // Keep it docked, but make the dock say so.
-          minimizedWins = minimizedWins.map((m) => (m.key === dockedKey ? { ...m, unread: (m.unread ?? 0) + 1 } : m));
-          render();
-        } else if (popOk) {
+        // THERE IS ONLY EVER ONE WINDOW PER CONVERSATION. `showing` asks which window DISPLAYS this
+        // conversation, not which one is keyed to it: a chat inside the two-pane Channels window is keyed
+        // `kind:channels`, so the old `conv:<id>` test saw "not open" and popped a second window on top of
+        // the one already showing it. Parked windows were never consulted at all.
+        const showing = windowShowing(p.conversationId);
+        const typing = isTyping();
+        const focusSafe = !joiningNewDevice && view.kind !== 'provisioning' && Date.now() >= suppressAutoOpenUntil && isPrimaryWindow(view);
+        if (showing === 'minimized') {
+          // Docked is a deliberate choice: respect it, just say something is waiting. Repaint ONLY the
+          // menubar — a full render() rebuilds root.innerHTML, and the live compose draft exists nowhere
+          // else, so re-rendering here would silently erase what the user is typing in another chat.
+          minimizedWins = minimizedWins.map((m) =>
+            activeConv(m.view)?.id === p.conversationId ? { ...m, unread: (m.unread ?? 0) + 1 } : m,
+          );
+          repaintPreservingDraft();
+        } else if (showing === 'parked') {
+          // Already on the desktop. Raise it instead of minting a duplicate: parked windows share one
+          // z-index, so DOM order decides, and DOM order is parkedWins order — moving the entry to the
+          // end brings it to the front WITHOUT touching `view`, so nothing steals focus either way.
+          const raised = parkedWins.filter((w) => activeConv(w.view)?.id === p.conversationId);
+          parkedWins = [...parkedWins.filter((w) => activeConv(w.view)?.id !== p.conversationId), ...raised];
+          if (typing || !focusSafe) {
+            repaintPreservingDraft(); // keep the user where they are; the raised window is visibly in front
+          } else {
+            // Not typing: promote the parked window to live, reusing ITS OWN view shape so windowKey
+            // matches and go() folds the parked copy rather than stacking a second one beside it.
+            const target = raised[raised.length - 1];
+            if (target !== undefined) {
+              go(target.view);
+            }
+          }
+        } else if (focusSafe && !typing) {
           void controller.openChannel(p.conversationId).then((transmit) => {
-            // Re-check at resolve time: the user may have navigated somewhere focus-sensitive while the
-            // decrypt was in flight.
-            if (joiningNewDevice || view.kind === 'provisioning' || !isPrimaryWindow(view)) {
+            // Re-check at resolve time: the user may have navigated somewhere focus-sensitive, or started
+            // typing, while the decrypt was in flight.
+            if (joiningNewDevice || view.kind === 'provisioning' || !isPrimaryWindow(view) || isTyping()) {
               return;
             }
             go({ kind: 'conversation', transmit });

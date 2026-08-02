@@ -50,6 +50,45 @@ describe('transmit renderer (M5 skin)', () => {
     expect(html).toContain('class="dd-cursor"');
   });
 
+  it('the trust badge spends red ONLY on a crypto fault, and never on a merely unverified contact', () => {
+    // The badge was a two-way readout of `secure`, which means "a channel summary decoded" — not a
+    // security claim at all. These cases pin the colour budget: red must stay rare enough to mean
+    // something, so an ordinary first contact (which is EVERY contact, TOFU is normal here) gets none.
+    const base: TransmitModel = { secure: true, peer: 'RAVEN', fingerprint: null, log: [], compose: '', conversationId: 'c1' };
+
+    // Normal unverified contact: honest, uncoloured, no alarm.
+    const unverified = renderTransmit({ ...base, trust: 'unverified' });
+    expect(unverified).toContain('ENCRYPTED');
+    expect(unverified).not.toContain('INSECURE');
+    expect(unverified).not.toContain('dd-trust-bad');
+
+    // Verified contact.
+    expect(renderTransmit({ ...base, trust: 'verified' })).toContain('SECURE');
+
+    // A pinned key that positively CHANGED: amber, not red — a reinstall produces this too.
+    const changed = renderTransmit({ ...base, trust: 'key-changed' });
+    expect(changed).toContain('KEY CHANGED');
+    expect(changed).toContain('dd-trust-warn');
+    expect(changed).not.toContain('dd-trust-bad');
+
+    // The crypto itself reporting a fault: red, and it names the reason.
+    const bad = renderTransmit({ ...base, trust: 'insecure', trustNote: 'member 0 (a13f…) has no certificate' });
+    expect(bad).toContain('INSECURE');
+    expect(bad).toContain('dd-trust-bad');
+    expect(bad).toContain('a13f');
+
+    // Undeliverable is NOT compromised: it stays SECURE with a qualifier rather than crying wolf.
+    const unreachable = renderTransmit({ ...base, trust: 'unreachable' });
+    expect(unreachable).toContain('SECURE');
+    expect(unreachable).toContain('UNREACHABLE');
+    expect(unreachable).not.toContain('INSECURE');
+
+    // Note to Self: no peer and no fingerprint, so the device count is the signal that it is healthy.
+    const selfOk = renderTransmit({ ...base, selfNote: true, trust: 'self', trustNote: '2 devices' });
+    expect(selfOk).toContain('SECURE');
+    expect(selfOk).toContain('2 devices');
+  });
+
   it('renders a secure conversation with peer fingerprint and a burn countdown', () => {
     const model: TransmitModel = {
       secure: true,
@@ -63,9 +102,14 @@ describe('transmit renderer (M5 skin)', () => {
       conversationId: 'raven',
     };
     const html = renderTransmit(model);
-    expect(html).toContain('<span class="dd-tx"></span>SECURE');
+    // A model carrying no verification evidence reads ENCRYPTED, not SECURE. The old badge said SECURE
+    // for every decodable channel — including one whose peer key had provably changed.
+    expect(html).toContain('ENCRYPTED');
     expect(html).toContain('class="dd-sub"');
-    expect(html).toContain('5F·A2·91·C4');
+    // The fingerprint is NO LONGER shown: summary.fingerprint is fingerprintOf(our own bootstrap key),
+    // so it never identified the peer, yet it was rendered next to the word "verified".
+    expect(html).not.toContain('5F·A2·91·C4');
+    expect(html).toContain('not verified');
     expect(html).toContain('burns 1:24'); // 84s formatted mm:ss
     expect(html).toContain('▢ message destroyed');
     // AIM23: the two-icon column (peer slot on top, self slot below) is present for a peer conversation.

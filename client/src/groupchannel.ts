@@ -778,6 +778,14 @@ export class GroupChannel {
     if (targets.length === 0) {
       return; // a self-group needs at least one sibling
     }
+    // The wasm now REFUSES to mint a self-group from a label-only credential (it would freeze a certless
+    // leaf 0 that no sibling can ever verify and nothing can repair). Self-heal first so that gate is a
+    // guard rather than a dead end: a seed-holder can always re-certify itself at the account's current
+    // epoch. Mirrors the identical mint-time guard in freshKeyPackages.
+    if (conv.accountKeyHex() !== '' && !(conv.credentialCertified?.() ?? true)) {
+      conv.reauthorizeAtEpoch(conv.certEpoch());
+      await this.resealSelf(); // persist the new credential before it goes into a group leaf
+    }
     // There is AT MOST ONE SUFFICIENT self-group. The app's hasSelfGroup() pre-check happens BEFORE it
     // fetches the sibling key packages (a network round-trip), and Note to Self can open a solo
     // self-group inside that window; without this re-check we would mint a second self-group and the

@@ -1813,6 +1813,17 @@ impl Conversation {
         let our = self
             .our_account_pub()
             .ok_or_else(|| "note to self needs an authorized device".to_string())?;
+        // GATE THE CREATOR, not only the members it admits. create_group_inner hands self.credential
+        // straight to MlsGroup::new, so a device whose own credential is label-only mints a group whose
+        // leaf 0 carries no certificate — and nothing in MLS can rewrite a leaf credential afterwards.
+        // classify_self EXEMPTS our own leaf, so that group looks perfectly healthy HERE while every
+        // sibling sees a certless member, refuses to classify it as a self-group, and surfaces it as an
+        // unusable ghost channel. It cost a live account its buddy-list sync until the group was
+        // replaced. Fail closed instead of freezing a defect nobody can repair: the caller re-certifies
+        // (reauthorizeAtEpoch) and retries. Peer conversations keep the ungated TOFU create.
+        if !self.credential_certified_inner() {
+            return Err("this device must re-certify before it can create a self-group".to_string());
+        }
         for kp_bytes in key_packages {
             let kp_in = KeyPackageIn::tls_deserialize_exact(kp_bytes)
                 .map_err(|e| format!("parse key package: {e:?}"))?;
@@ -5441,6 +5452,33 @@ mod tests {
         assert!(
             d2.join_from_welcome_inner(&w2).is_err(),
             "a one-time key package must not open a second Welcome"
+        );
+    }
+
+    // THE GHOST-CHANNEL ORIGIN, closed at the source. create_group_inner passes self.credential to
+    // MlsGroup::new ungated, so a device holding the account key but a label-only credential could mint
+    // a self-group whose OWN leaf 0 is certless. classify_self exempts our own leaf, so the creator saw
+    // it as healthy while every sibling saw a certless member and refused it — and no MLS operation can
+    // rewrite a leaf credential, so the group was poisoned for life. The mint must fail closed.
+    #[test]
+    fn a_device_with_a_label_only_credential_cannot_mint_a_self_group() {
+        // Seed-holder whose own credential is label-only: it HAS the account key (so our_account_pub
+        // succeeds and the old gate let it straight through) while its own leaf carries no certificate.
+        // This is exactly the state from_sealed_inner restores from a pre-P6 blob — aak restored, but a
+        // label-only credential — which is how it reached a live account.
+        let mut d1 = Conversation::new_authorized_inner("d1", &[91u8; 32]).unwrap();
+        d1.credential = CredentialWithKey {
+            credential: BasicCredential::new(b"d1".to_vec()).into(),
+            signature_key: d1.signer.public().into(),
+        };
+        assert!(d1.our_account_pub().is_some(), "precondition: it still holds the account key");
+        assert!(!d1.credential_certified_inner(), "precondition: our own credential is label-only");
+
+        let d2 = Conversation::new_authorized_inner("d2", &[91u8; 32]).unwrap();
+        let err = d1.create_self_group_inner(&[d2.key_package().unwrap()]).unwrap_err();
+        assert!(
+            err.contains("re-certify"),
+            "a label-only creator must be refused, not allowed to freeze a certless leaf 0; got: {err}"
         );
     }
 

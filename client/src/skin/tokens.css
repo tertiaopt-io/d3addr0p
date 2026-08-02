@@ -37,9 +37,12 @@ body { background: #07070c; }
   --dd-name-self: #8fd0ff;
   --dd-name-peer: #ffce8a;
 
-  /* Functional tones: warm for near-expiry countdown, green for the secure transmit indicator. */
+  /* Functional tones: warm for near-expiry countdown, green for the secure transmit indicator, red for
+     a crypto-level fault. --dd-danger is spent ONLY where the crypto itself reports something wrong, so
+     that it still carries meaning on the rare occasion it appears. */
   --dd-warn: #ffce5e;
   --dd-secure: #74f0a8;
+  --dd-danger: #ff6b6b;
 
   /* Block cursor. */
   --dd-cursor: var(--dd-ink);

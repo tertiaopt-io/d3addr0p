@@ -2446,6 +2446,47 @@ export class AppControllerImpl implements AppController {
         log.push({ kind: 'system', text: '» identity changed · this is not the key you verified for this buddy · confirm with them before trusting this channel' });
       }
     }
+    // THE HEADER TRUST BADGE. Computed here, once, so every surface agrees — and kept SEPARATE from
+    // `secure` above, which is not a security predicate at all: it means "a channel summary decoded, or
+    // this is the self-group", and it gates whether the compose box is typeable. Overloading it would
+    // disable typing exactly when we want to warn the user.
+    //
+    // Precedence is deliberate: a crypto-level fault must never be masked by a milder state, and a
+    // merely-unverified contact must never be painted as an alarm. Every new conversation starts
+    // unverified (TOFU is disclosed in honest-limits), so colouring that red would train the user to
+    // ignore the badge precisely when it finally means something.
+    let trust: TransmitModel['trust'];
+    let trustNote: string | undefined;
+    if (!secure) {
+      trust = 'offline';
+    } else if (isSelf) {
+      // The own-devices group carries the contact graph and Note to Self. A classification failure here
+      // is an alarm, unlike in the channel list where 'different account' is the NORMAL answer for a
+      // genuine peer chat — isSelf is already established, so a foreign account in this roster is real.
+      const reason = this.groupChannel?.selfClassificationReason?.(id) ?? '';
+      const benign = reason === '' || reason === 'self' || reason === 'no such conversation' || reason.startsWith('this device has no account anchor');
+      if (benign) {
+        trust = 'self';
+        const n = this.groupChannel?.roster(id).length ?? 0;
+        trustNote = n > 0 ? `${n} device${n === 1 ? '' : 's'}` : undefined;
+      } else {
+        trust = 'insecure';
+        trustNote = reason;
+      }
+    } else if (this.groupChannel?.isUnlinkedConversationId(id) === true) {
+      // A DELIVERABILITY fact, not a compromise: no member's identity verifies, so nothing sent here can
+      // be read. Painting that red as "potentially compromised" would be a lie in the alarming direction.
+      trust = 'unreachable';
+    } else if (verifyState === 'changed') {
+      // A pinned account key positively changed. This is the MITM shape, and it is rare — but a reinstall
+      // produces it too, so it gets its own amber state rather than the red reserved for crypto faults.
+      trust = 'key-changed';
+    } else if (verifyState === 'verified') {
+      trust = 'verified';
+    } else {
+      trust = 'unverified'; // 'none' | 'stale' | 'unavailable': missing evidence is not evidence of attack
+      trustNote = verifyState === 'stale' ? 'cannot check right now' : undefined;
+    }
     // ONE read of this conversation's stored messages, shared by the arm loop and the log build:
     // openChannel is the hottest path in the app (every send, every inbound message in the open
     // conversation, every heal), and it used to getAll the ENTIRE keyvault twice per call.
@@ -2556,6 +2597,8 @@ export class AppControllerImpl implements AppController {
       peer,
       fingerprint: isSelf ? null : (summary?.fingerprint ?? null),
       selfNote: isSelf,
+      trust,
+      ...(trustNote !== undefined ? { trustNote } : {}),
       // Only the self-group view carries the split diagnostic (roster size + Welcome counters).
       ...(isSelf ? { selfDiag: this.groupChannel?.selfGroupDiagnostic() ?? '' } : {}),
       peerHandle,

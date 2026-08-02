@@ -189,7 +189,10 @@ class FakeController implements AppController {
     if (id !== undefined && this.deadIds.has(id)) {
       return Promise.resolve({ ...transmit('UNKNOWN'), secure: false, conversationId: id });
     }
-    return Promise.resolve({ ...transmit('PEER'), log: this.conversationLog });
+    // Return the conversation that was ASKED FOR. Returning a fixed 'c1' for every id made every window
+    // key identical, so any test about opening the wrong window — duplicates, focus theft, raise-vs-pop —
+    // could not fail no matter how broken the app was.
+    return Promise.resolve({ ...transmit('PEER'), conversationId: id ?? 'c1', log: this.conversationLog });
   }
   openNoteToSelf(): Promise<TransmitModel> {
     return Promise.resolve({ ...transmit('Note to Self'), selfNote: true, log: this.conversationLog });
@@ -2774,6 +2777,66 @@ describe('buddy list header status control (the little ◆)', () => {
     c.emit('inbound-message', { conversationId: 'c1' });
     // The conversation window is now open in front (which is also what arms the burn countdown).
     await waitFor(() => root.querySelector('#dd-compose-form') !== null);
+  });
+
+  it('an arrival for a PARKED conversation raises it instead of opening a SECOND window for it', async () => {
+    // The duplicate-window bug. A window's key is conv:<id> for a standalone chat but kind:<kind> for
+    // everything else, and the arrival handler asked "is this open?" by comparing the id against the LIVE
+    // window plus a conv:<id> lookup in the dock — parked windows were never consulted. So a chat you had
+    // navigated away from was judged "not open" and a second window was minted on top of the first.
+    // The window must be the TWO-PANE Channels one: a parked standalone chat is keyed conv:<id>, which
+    // go() already folds correctly. The two-pane is keyed kind:channels while DISPLAYING c1, so a
+    // conv:c1 lookup misses it — that asymmetry is the entire bug.
+    const { root, c } = await onBuddyList((cc) => {
+      cc.channelsList = [{ id: 'c1', peer: 'PEER', fingerprint: '', status: 'secure' as const, preview: '', unread: 0 }];
+    });
+    c.emit('connection', { state: 'secure' });
+    clickMenu(root, 'Channels');
+    await waitFor(() => root.querySelector('[data-channel="c1"]') !== null);
+    click(root, '[data-channel="c1"]'); // c1 now lives INSIDE the channels window
+    await waitFor(() => root.querySelector('#dd-compose-form') !== null);
+
+    // Navigate away so that two-pane window PARKS, still displaying c1.
+    clickMenu(root, 'Buddies');
+    // Wait for the LIVE window to actually become the buddy list. Waiting on '.dd-blhead' is not enough:
+    // parked windows are fully painted, so that element already existed in the parked buddy window and
+    // the wait passed before the navigation landed — leaving Channels live and the arrival taking the
+    // in-place path, which is why every earlier version of this test could not fail.
+    await waitFor(() => root.querySelector('[data-win-key]')?.getAttribute('data-win-key') === 'kind:buddies');
+    expect(root.querySelector('[data-win-key="kind:channels"]')).not.toBeNull(); // parked, displaying c1
+    const before = root.querySelectorAll('[data-win-key]').length;
+
+    c.emit('inbound-message', { conversationId: 'c1' });
+    await new Promise((r) => setTimeout(r, 30));
+
+    // c1 is displayed by the parked kind:channels window, so a SECOND window keyed conv:c1 must never
+    // appear beside it, and the desktop must not grow.
+    expect(root.querySelector('[data-win-key="conv:c1"]')).toBeNull();
+    expect(root.querySelectorAll('[data-win-key]').length).toBe(before);
+  });
+
+  it('an arrival does NOT steal focus or wipe the draft while the user is typing in another chat', async () => {
+    // "should not steal the focus if the user is already typing into another chat". A cross-conversation
+    // pop is by definition not an in-place refresh, so render() re-focused the compose box and rebuilt
+    // root.innerHTML — and the draft lives ONLY in that DOM node, so the half-typed sentence vanished.
+    const { root, c } = await onBuddyList((cc) => {
+      cc.buddies = [{ username: 'devinjacks', addedAt: 0, group: 'Buddies' }];
+    });
+    c.emit('connection', { state: 'secure' });
+    root.querySelector('[data-buddy-select="devinjacks"]')!.dispatchEvent(new Event('dblclick', { bubbles: true }));
+    await waitFor(() => root.querySelector('#dd-compose-form') !== null);
+
+    const compose = root.querySelector('#dd-compose-input') as HTMLElement;
+    compose.textContent = 'half a sentence';
+    compose.focus();
+    compose.dispatchEvent(new Event('input', { bubbles: true }));
+
+    c.emit('inbound-message', { conversationId: 'c-other' }); // a DIFFERENT conversation arrives
+    await new Promise((r) => setTimeout(r, 20));
+
+    const after = root.querySelector('#dd-compose-input') as HTMLElement;
+    expect(after.textContent).toContain('half a sentence'); // the draft survived
+    expect(document.activeElement).toBe(after); // and the caret was not yanked away
   });
 
   it('AIM behavior: a DOCKED conversation stays docked and its chip shows an unread indicator', async () => {
