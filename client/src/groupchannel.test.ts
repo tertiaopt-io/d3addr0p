@@ -1195,12 +1195,15 @@ describe('GroupChannel', () => {
   it('a self-group Welcome whose join FAILS is not acked away, and converges once the join can succeed', async () => {
     // Fix C. The bare `catch { ack(); return; }` acked a failed join, and an ack destroys the only copy
     // on a hold-until-ack bus — one transient failure split the account permanently and silently.
+    // The example here must be a genuinely RETRYABLE error: a Welcome that cannot open because its key
+    // package is gone is permanent and is acked on purpose (see the publish-loop test below). A storage
+    // hiccup is the real case this protects — it succeeds on the very next delivery.
     const bus = makeBus();
     const phone = addDevice(bus, hx('d7'), '9a86');
     const laptop = addDevice(bus, hx('fc'), '2e44');
     await phone.ch.connectGateway('ws://x/ws');
     await laptop.ch.connectGateway('ws://x/ws');
-    laptop.conv.joinThrow = 'process welcome: NoMatchingKeyPackage';
+    laptop.conv.joinThrow = 'process welcome: storage write failed';
 
     await phone.ch.createSelfGroup([{ deviceKey: hx('fc'), keyPackage: new Uint8Array([7]) }]);
     bus.flush();
@@ -1276,6 +1279,39 @@ describe('GroupChannel', () => {
     bus.flush();
     await new Promise((r) => setTimeout(r, 0));
     expect(phone.outbox).toHaveLength(0);
+  });
+
+  it('an UNOPENABLE Welcome is acked once and the outbox stops replaying it (no publish loop)', async () => {
+    // Observed live: a mobile client reported W1707/0 — 1707 Welcomes seen, none joined. Two of my own
+    // changes multiplied together. NoMatchingKeyPackage was not on the permanent list, so a Welcome
+    // sealed to a key package whose private half is gone was never acked and redelivered on every
+    // re-subscribe; and the outbox re-published a NEW envelope (new messageId) on every reconnect, so
+    // copies accumulated up to the bus cap and EACH of them redelivered. A dead Welcome must die once.
+    const bus = makeBus();
+    const phone = addDevice(bus, hx('d7'), '9a86');
+    const laptop = addDevice(bus, hx('fc'), '2e44');
+    await phone.ch.connectGateway('ws://x/ws');
+    await laptop.ch.connectGateway('ws://x/ws');
+    laptop.conv.joinThrow = 'process welcome: WelcomeError(NoMatchingKeyPackage)';
+
+    await phone.ch.createSelfGroup([{ deviceKey: hx('fc'), keyPackage: new Uint8Array([7]) }]);
+    bus.flush();
+    await new Promise((r) => setTimeout(r, 0));
+
+    // The recipient can never open it, so it is acked and DROPPED rather than held for redelivery.
+    expect(laptop.ch.selfConversationId()).toBeNull();
+    expect(bus.acked.size).toBe(1);
+    expect(bus.queue.length).toBe(0);
+
+    // And the sender gives up rather than re-publishing forever: many reconnects must not grow the
+    // recipient's mailbox without bound.
+    for (let i = 0; i < 20; i++) {
+      await phone.ch.connectGateway('ws://x/ws');
+      bus.flush();
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    expect(phone.outbox).toHaveLength(0); // retired after the attempt cap
+    expect(bus.queue.length).toBe(0); // nothing left pinned in the mailbox
   });
 
   it('syncBuddies publishes the buddy list ONLY to the self-group, never to a peer conversation', async () => {

@@ -156,6 +156,7 @@ export interface PendingWelcome {
   deviceKey: string; // the recipient's bootstrap mailbox
   welcomeHex: string;
   createdAt: number;
+  attempts?: number; // replays so far; capped so a dead Welcome cannot be re-published without end
 }
 
 /** One open conversation's live state. The MLS group id lives in `session.groupId`; the conversationId
@@ -1912,20 +1913,42 @@ export class GroupChannel {
       return;
     }
     const cutoff = Date.now() - WELCOME_OUTBOX_TTL_MS;
-    const live = this.welcomeOutbox.filter((e) => e.createdAt >= cutoff);
-    for (const e of live) {
+    // Devices already sitting in our canonical self-group need nothing: whatever this entry was for is
+    // obsolete. Without this a Welcome for a group we have since REPLACED is re-published forever — the
+    // liveness rule retires per-conversation, and a superseded conversation never sees traffic again, so
+    // it never retires. That, plus a recipient that cannot open the blob, is an unbounded publish loop.
+    let settled = new Set<string>();
+    const best = this.selfSessionBest();
+    if (best !== null) {
+      try {
+        settled = new Set(best.session.roster());
+      } catch {
+        /* an unreadable roster just means we retire nothing this pass */
+      }
+    }
+    const live: PendingWelcome[] = [];
+    for (const e of this.welcomeOutbox) {
+      if (e.createdAt < cutoff || settled.has(e.deviceKey)) {
+        continue; // expired, or the sibling is already a member of the group we actually use
+      }
+      // A replay that has been ignored this many times is not going to start working: every attempt
+      // publishes a NEW envelope (new messageId), so an unopenable Welcome would otherwise pile copies
+      // into the recipient's mailbox up to the bus cap, each redelivered on each of its re-subscribes.
+      const attempts = (e.attempts ?? 0) + 1;
+      if (attempts > WELCOME_OUTBOX_MAX_ATTEMPTS) {
+        continue;
+      }
+      live.push({ ...e, attempts });
       try {
         t.publish({ messageId: randomBytes(16), routingKey: e.deviceKey, payload: hexToBytes(e.welcomeHex), ttlSeconds: WELCOME_TTL_SECONDS });
       } catch {
         /* a closed socket: the next reconnect replays this entry again */
       }
     }
-    if (live.length !== this.welcomeOutbox.length) {
-      this.welcomeOutbox = live;
-      await this.persistence?.saveWelcomeOutbox?.(live).catch(() => {
-        /* best-effort */
-      });
-    }
+    this.welcomeOutbox = live;
+    await this.persistence?.saveWelcomeOutbox?.(live).catch(() => {
+      /* best-effort */
+    });
   }
 
   private async resealSelf(): Promise<boolean> {
@@ -2043,6 +2066,7 @@ export class GroupChannel {
       return;
     }
     this.welcomesJoined += 1;
+    this.lastWelcomeError = ''; // a join succeeded: stop showing a failure the account has moved past
     const conversationId = this.convId(session.groupId);
     if (this.sessions.has(conversationId)) {
       t.ack(env.messageId); // already joined (belt-and-suspenders alongside the wasm collision guard)
@@ -2282,6 +2306,9 @@ const WELCOME_TTL_SECONDS = GATEWAY_MAX_TTL_SECONDS;
 // How long the SENDER keeps re-publishing an unacknowledged Welcome across reconnects. This is the real
 // delivery window now: it spans gateway restarts and crashes, which the bus TTL never could.
 const WELCOME_OUTBOX_TTL_MS = SEVEN_DAYS * 1000;
+// Replays before an entry is given up on. Generous enough to span a sibling that is offline across many
+// reconnects, small enough that a Welcome nobody can open cannot fill a mailbox.
+const WELCOME_OUTBOX_MAX_ATTEMPTS = 12;
 const PROV_TTL = 600; // provisioning frames are control-plane and short-lived (10 min backstop)
 // How long a revoke waits for its gateway receipt before rejecting (the sender keeps its copy and can
 // retry). One gateway round trip in practice; generous for real-network latency, like the backstops below.
@@ -2301,7 +2328,18 @@ const OWN_ECHO_DROP_PREFIX = POISON_DROP_PREFIX + 'own frame';
 // `process welcome: ... NoMatchingKeyPackage`, whose sender can re-issue against a fresh package —
 // is left unacked so it redelivers, bounded by the bus TTL. Mirrors the wasm error strings in
 // join_from_welcome_inner (crypto/src/conversation.rs).
-const PERMANENT_WELCOME_FAILURES = ['already a member of this group', 'parse welcome:', 'expected a Welcome message'];
+// A key package's private half cannot come back once it is gone, so a Welcome sealed to one is dead to
+// this device FOREVER. Leaving it unacked (the original Fix C list omitted it) does not help the sender
+// — re-issuing produces a NEW envelope with a new message id — it only guarantees the bus redelivers a
+// blob that can never open, on every re-subscribe, until its TTL. Observed live: a mobile client seeing
+// 1707 Welcomes and joining none of them.
+const PERMANENT_WELCOME_FAILURES = [
+  'already a member of this group',
+  'parse welcome:',
+  'expected a Welcome message',
+  'NoMatchingKeyPackage',
+  'NoMatchingEncryptionKey',
+];
 function isPermanentWelcomeFailure(detail: string): boolean {
   return detail.startsWith(POISON_DROP_PREFIX) || PERMANENT_WELCOME_FAILURES.some((m) => detail.includes(m));
 }
