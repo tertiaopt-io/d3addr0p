@@ -37,6 +37,10 @@ export interface GroupConversationLike {
   signaturePublicKeyHex(): string;
   accountKeyHex(): string; // the account authorization key (empty for a legacy/unauthorized identity)
   keyPackage(): Uint8Array;
+  // This conversation's MLS epoch, or -1 when not held. Diagnostic only. Two devices can both classify
+  // a group as their self-group and still be unable to read each other if their epochs have diverged,
+  // which no certificate check can surface. Optional so older wasm builds still load.
+  groupEpoch?(conversationId: string): number;
   // The LAST-RESORT package: carries the MLS LastResort extension so OpenMLS keeps its private
   // bundle after a join. The directory re-serves that row forever, so an unmarked package there is
   // un-openable from the second claim on. Optional so older wasm builds still load.

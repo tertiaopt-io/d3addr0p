@@ -1040,6 +1040,64 @@ describe('device management', () => {
     }
   });
 
+  it('SG1: the grace window expires on its OWN timer, with no later external trigger', async () => {
+    // The window was a wall-clock comparison with NOTHING scheduled to re-read it: arming
+    // selfMintDeferredSince recorded a timestamp and returned. So it expired only if some unrelated
+    // event happened along afterwards — which is exactly why the test above has to dispatch
+    // visibilitychange to make its mint happen. On a quiet, foregrounded tab no such event arrives and
+    // the account never forms its self-group (the recorded 19-hour non-formation). Here the only thing
+    // that happens after the deferral is armed is the clock advancing.
+    const LOWER = '0'.repeat(64);
+    const transport = fakeTransport({
+      '/api/login': { status: 200, body: { token: 'tok' } },
+      '/api/add-device': { status: 200, body: { deviceId: 'd1' } },
+      '/api/publish-keys': { status: 201 },
+      '/api/list-devices': {
+        status: 200,
+        body: {
+          devices: [
+            device({ deviceId: 'd1', deviceKey: SIG, current: true }),
+            device({ deviceId: 'd2', deviceKey: LOWER }),
+          ],
+        },
+      },
+      '/api/take-keys': {
+        status: 200,
+        body: { devices: [{ deviceKey: LOWER, keyPackage: 'abcd', lastResort: false }] },
+      },
+    });
+    const ctl = new FakeController();
+    ctl.selfGroupExists = true; // login finds one, so no deferral is armed on real timers during startup
+    const { root } = setup(new AccountClient(transport), ctl);
+    fill(root, '#dd-user', 'alice');
+    fill(root, '#dd-pass', 'pw');
+    submitForm(root);
+    await waitFor(() => root.querySelector('.dd-blhead') !== null);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(ctl.mints).toHaveLength(0);
+
+    vi.useFakeTimers();
+    let onRealTimers = false;
+    try {
+      // The self-group is gone; ONE trigger arms the deferral (and, with the fix, schedules its timer).
+      ctl.selfGroupExists = false;
+      document.dispatchEvent(new Event('visibilitychange'));
+      await vi.advanceTimersByTimeAsync(50);
+      expect(ctl.mints).toHaveLength(0); // deferring: the lower-keyed sibling owns the mint
+
+      // From here NOTHING external happens — no focus, no reconnect, no user action. Only the clock.
+      await vi.advanceTimersByTimeAsync(20000); // past SELF_MINT_FALLBACK_MS + its jitter
+      vi.useRealTimers();
+      onRealTimers = true;
+      await waitFor(() => ctl.mints.length === 1);
+      expect(ctl.mints[0]?.[0]?.deviceKey).toBe(LOWER);
+    } finally {
+      if (!onRealTimers) {
+        vi.useRealTimers();
+      }
+    }
+  });
+
   it('backfills P7 records for devices revoked before records existed, once each', async () => {
     // The migration. An account that has been revoking devices since before P7 has burned server rows
     // and no records, so those devices are held out only by the epoch floor, which a seed-holder walks

@@ -2225,7 +2225,10 @@ export class AppControllerImpl implements AppController {
           reason !== 'no such conversation' &&
           reason.indexOf('different account') === -1
         ) {
-          return { ...c, preview: 'self-group not recognized: ' + reason };
+          // Include the group id: two poisoned groups minted by the SAME sibling render with identical
+          // labels and identical reasons, so without the id they are indistinguishable on screen and
+          // there is no way to tell one ghost row from the other.
+          return { ...c, preview: `self-group ${c.id.replace(/^c-/, '').slice(0, 8)} not recognized: ${reason}` };
         }
         if (this.groupChannel?.heldConversationIds().includes(c.id) !== true) {
           return { ...c, preview: 'no live crypto session (dead ghost)' };

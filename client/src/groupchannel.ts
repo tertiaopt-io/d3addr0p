@@ -437,10 +437,40 @@ export class GroupChannel {
     return !(this.conv.credentialCertified?.() ?? false);
   }
 
+  /** True when our best self-group is one whose OWN leaf is the uncertified member — the single state a
+   * populated self-group can never recover from, and the one that deadlocks this device.
+   *
+   * `lenient && !strict` IS EXACTLY THAT, with no new crypto needed. `selfSessionBest` only considers
+   * sessions where the LENIENT classification holds, and lenient differs from strict SOLELY by the
+   * own-leaf skip in the wasm — every other conjunct is identical. So a group that classifies leniently
+   * but not strictly can only be failing on our own leaf; every other member already verified.
+   *
+   * Why that state is fatal rather than merely degraded: the group looks perfectly healthy HERE (we
+   * exempt ourselves) while every sibling sees a certless member, refuses to classify it as a
+   * self-group, and surfaces it as a ghost channel. Nothing can rewrite a leaf credential in place, so
+   * the only exit is minting a certified replacement — which is a POPULATED mint through
+   * `createSelfGroup`, not the solo `createSelf` that `openSelfConversation` would do.
+   *
+   * ANTI-LOOP: gated on our own credential being certified now. A device whose credential is still
+   * label-only would mint an equally poisoned group on every trigger, forever. */
+  private selfGroupNeedsCertifiedReplacement(): boolean {
+    const best = this.selfSessionBest();
+    if (best === null || best.strict) {
+      return false; // nothing held, or already fully certified
+    }
+    if (this.conv === null || this.conv.accountKeyHex().length === 0) {
+      return false; // a cert-only device anchors nothing; it waits for a Welcome
+    }
+    if (best.session.roster().length < 2) {
+      return false; // a solo group is the existing selfGroupSuffices case, not this one
+    }
+    return this.conv.credentialCertified?.() ?? false;
+  }
+
   /** Whether the hidden self-group is open (and does not need a certified replacement). The app uses
    * this so only the designated device creates or replaces it. */
   hasSelfGroup(): boolean {
-    return this.selfGroupSuffices();
+    return this.selfGroupSuffices() && !this.selfGroupNeedsCertifiedReplacement();
   }
 
   /** The conversationId of the open hidden self-group (Note to Self rides it), or null when none is
@@ -473,6 +503,14 @@ export class GroupChannel {
       }
       if (n > 0) {
         parts.push(`${n} device${n === 1 ? '' : 's'}`);
+      }
+      // The MLS epoch. Two devices showing the SAME group id and the SAME device count can still be
+      // unable to read each other when their epochs have diverged — one is committing into a state the
+      // other has not merged. That looks exactly like "my messages never arrive but theirs do", and no
+      // certificate or classification check can reveal it, so it goes on screen next to the id.
+      const epoch = this.conv?.groupEpoch?.(session.groupId);
+      if (epoch !== undefined && epoch >= 0) {
+        parts.push(`e${epoch}`);
       }
     }
     parts.push(`W${this.welcomesSeen}/${this.welcomesJoined}`);
@@ -745,7 +783,11 @@ export class GroupChannel {
     // two devices would sync over different groups (silently splitting the buddy list and notes). The
     // sibling folds into the existing group through the normal reconcile path instead. A lenient-only
     // best on a seed-holder does NOT abort: the certified replacement is exactly what this mint is for.
-    if (this.selfGroupSuffices()) {
+    // Use the SAME predicate the app's pre-check used (hasSelfGroup), not the bare selfGroupSuffices:
+    // a populated lenient-only group makes selfGroupSuffices true, so this re-check used to abort the
+    // certified replacement the caller was invoked to perform — contradicting the comment directly
+    // above it and leaving the device parked on a group every sibling sees as a ghost.
+    if (this.selfGroupSuffices() && !this.selfGroupNeedsCertifiedReplacement()) {
       return;
     }
     // BIRTH-gated in the wasm: every founding package must chain to OUR account, so a stale

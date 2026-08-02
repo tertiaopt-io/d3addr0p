@@ -1047,6 +1047,23 @@ impl Conversation {
         self.self_classification_reason(conversation_id)
     }
 
+    /// This conversation's current MLS epoch, or -1 when we do not hold it. Diagnostic only: it grants
+    /// nothing and decides nothing. Two devices that BOTH classify a group as their self-group but sit
+    /// on DIFFERENT epochs cannot read each other's frames, which looks exactly like "my messages are
+    /// invisible to my other device" while inbound ones still arrive — a symptom no certificate check
+    /// can explain, so the epoch has to be readable on screen.
+    #[wasm_bindgen(js_name = groupEpoch)]
+    pub fn group_epoch(&self, conversation_id: &str) -> f64 {
+        let gid = match hex_to_bytes(conversation_id) {
+            Ok(g) => g,
+            Err(_) => return -1.0,
+        };
+        match self.groups.get(&gid) {
+            Some(slot) => slot.group.epoch().as_u64() as f64,
+            None => -1.0,
+        }
+    }
+
     /// Whether OUR OWN current credential carries a verifying device certificate, i.e. a group minted
     /// RIGHT NOW would classify strict. Gates the certified-replacement mint: a legacy label-only
     /// seed-holder must not mint (its replacement would be lenient-only too, and the mint would repeat
@@ -2684,7 +2701,8 @@ impl Conversation {
     /// non-sensitive reason string instead of a bool. It CANNOT weaken the privacy guard: it makes no
     /// decision and grants no access; it only names the first member or condition that fails, so a stuck
     /// pairing can be diagnosed by READING the cause instead of guessing at rosters the keyless gateway
-    /// cannot show. "self" means every check passed. Never emits key bytes (only member indices).
+    /// cannot show. "self" means every check passed. Emits a member's leaf index and a 4-byte prefix of
+    /// its PUBLIC signature key (the directory already serves those), never any secret.
     fn self_classification_reason(&self, gid_hex: &str) -> String {
         let gid = match hex_to_bytes(gid_hex) {
             Ok(g) => g,
@@ -2713,17 +2731,25 @@ impl Conversation {
             if m.index == own {
                 continue; // own-leaf exemption, same as classify_self lenient mode
             }
+            // Name the offending device, not just its leaf index. A bare index cannot tell a laptop's
+            // frozen creator leaf from a stale pre-revoke sibling leaf from an orphan, which is exactly
+            // the discrimination a live diagnosis needs. Device signature keys are PUBLIC (the directory
+            // serves them), so a 4-byte prefix leaks nothing that a lookup does not already give.
+            let who = {
+                let k = hex(&m.signature_key);
+                format!("member {} ({}…)", m.index, &k[..8.min(k.len())])
+            };
             let identity = match BasicCredential::try_from(m.credential.clone()) {
                 Ok(bc) => bc.identity().to_vec(),
-                Err(_) => return format!("member {} has an unreadable credential", m.index),
+                Err(_) => return format!("{who} has an unreadable credential"),
             };
             match parse_auth_identity(&identity) {
-                None => return format!("member {} has no certificate (legacy/label-only leaf)", m.index),
+                None => return format!("{who} has no certificate (legacy/label-only leaf)"),
                 Some(ai) if ai.aak_pub != our_aak => {
-                    return format!("member {} belongs to a different account", m.index);
+                    return format!("{who} belongs to a different account");
                 }
                 Some(ai) if !verify_device_cert(&ai.aak_pub, ai.cert_epoch, &m.signature_key, &ai.cert) => {
-                    return format!("member {} certificate does not verify (epoch {})", m.index, ai.cert_epoch);
+                    return format!("{who} certificate does not verify (epoch {})", ai.cert_epoch);
                 }
                 Some(_) => {}
             }
@@ -5416,6 +5442,38 @@ mod tests {
             d2.join_from_welcome_inner(&w2).is_err(),
             "a one-time key package must not open a second Welcome"
         );
+    }
+
+    // A bare leaf index cannot tell a frozen creator leaf from a stale sibling leaf from an orphan, and
+    // that is exactly the discrimination a live diagnosis needs (the phone has no console). Assert the
+    // reason names the offending device by a prefix of its REAL signature key, read from the roster
+    // rather than a fixture constant.
+    #[test]
+    fn the_classification_reason_names_the_offending_device_not_just_its_index() {
+        let mut d1 = Conversation::new_authorized_inner("d1", &[81u8; 32]).unwrap();
+        let d2 = Conversation::new_inner("d2").unwrap(); // legacy label-only: never authorized
+        let (_w, gid) = d1.create_group_inner(&[d2.key_package().unwrap()]).unwrap();
+
+        let reason = d1.self_classification_reason(&hex(&gid));
+        assert!(reason.contains("has no certificate"), "expected the certless branch, got: {reason}");
+        let key = d2.signature_public_key_hex();
+        assert!(
+            reason.contains(&key[..8]),
+            "the reason must name the offending device by key prefix; got {reason}, expected to contain {}",
+            &key[..8]
+        );
+    }
+
+    // Two devices can BOTH classify a group as their self-group and still be unable to read each other
+    // if they sit on different MLS epochs. No certificate check can surface that, so the epoch has to be
+    // readable. -1 for a group we do not hold keeps the accessor total (no throw on the UI path).
+    #[test]
+    fn group_epoch_is_readable_and_minus_one_for_an_unheld_group() {
+        let mut d1 = Conversation::new_authorized_inner("d1", &[82u8; 32]).unwrap();
+        let d2 = Conversation::new_inner("d2").unwrap();
+        let (_w, gid) = d1.create_group_inner(&[d2.key_package().unwrap()]).unwrap();
+        assert!(d1.group_epoch(&hex(&gid)) >= 0.0, "a held group must report a real epoch");
+        assert_eq!(d1.group_epoch(&hex(&[9u8; 32])), -1.0, "an unheld group must read -1, not panic");
     }
 
     // The cert-only fallback must NOT weaken the peer boundary: a group holding a PEER is still not a

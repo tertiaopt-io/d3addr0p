@@ -7848,8 +7848,23 @@ export function mountApp(
   // the normal case race-free (one minter); the deterministic canonical selection (certified > largest
   // roster > lowest id) converges the rare double-mint. Formation can stall for a window; it can no
   // longer stall forever.
-  const SELF_MINT_FALLBACK_MS = 45000;
+  // How long a non-designated device waits for the designated one to mint before minting itself. This
+  // used to be 45s AND was never actually waited out: arming `selfMintDeferredSince` only recorded a
+  // timestamp, and nothing scheduled the later pass that would read it — so the "fallback" fired only
+  // if some UNRELATED trigger (a reconnect, a tab focus) happened along after the window. With no such
+  // trigger it never fired at all, which is how an account sat unformed for hours. It is now armed with
+  // a real timer, so 12s is a genuine bound rather than an optimistic one; both racing mints are
+  // populated, and selfSessionBest's deterministic ranking converges them.
+  const SELF_MINT_FALLBACK_MS = 12000;
+  const SELF_MINT_JITTER_MS = 4000; // spread simultaneous wake-ups so two devices do not mint in lockstep
   let selfMintDeferredSince: number | null = null;
+  let selfMintFallbackTimer: ReturnType<typeof setTimeout> | null = null;
+  // Consecutive mint failures. Every attempt burns a one-time prekey per sibling, and the control plane
+  // returns a take-keys THROTTLE as HTTP 200 with an empty device list — byte-identical to an account
+  // with no other devices. Without a backoff a self-inflicted throttle reads to us as "nothing to claim
+  // yet" and spins silently forever, draining prekeys the whole time.
+  const SELF_MINT_MAX_FAILURES = 6;
+  let selfMintFailures = 0;
   let ensuringSelfGroup = false;
   async function ensureSelfGroup(): Promise<void> {
     if (
@@ -7891,6 +7906,11 @@ export function mountApp(
       }
       if (await controller.hasSelfGroup()) {
         selfMintDeferredSince = null; // a self-group exists: nothing to form, and no fallback is armed
+        selfMintFailures = 0;
+        if (selfMintFallbackTimer !== null) {
+          clearTimeout(selfMintFallbackTimer);
+          selfMintFallbackTimer = null;
+        }
         return;
       }
       // Deterministic single creator: the lowest-keyed device creates it; others join via the Welcome.
@@ -7903,12 +7923,29 @@ export function mountApp(
       if ([...ownDeviceKeys].sort()[0] !== currentDeviceKey) {
         if (selfMintDeferredSince === null) {
           selfMintDeferredSince = Date.now();
+          // ARM A REAL TIMER. Recording the timestamp alone made the window depend on an unrelated
+          // later trigger; on a quiet, foregrounded tab none arrives and the deferral never expires.
+          if (selfMintFallbackTimer !== null) {
+            clearTimeout(selfMintFallbackTimer);
+          }
+          selfMintFallbackTimer = setTimeout(
+            () => {
+              selfMintFallbackTimer = null;
+              void ensureSelfGroup();
+            },
+            SELF_MINT_FALLBACK_MS + Math.floor(Math.random() * SELF_MINT_JITTER_MS),
+          );
           return; // first sight: give the designated device its window
         }
         if (Date.now() - selfMintDeferredSince < SELF_MINT_FALLBACK_MS) {
           return; // still inside the window: keep waiting for the designated device's Welcome
         }
         console.warn('self-group fallback: the designated device has not formed the group; minting from this device');
+      }
+      if (selfMintFailures >= SELF_MINT_MAX_FAILURES) {
+        // Parked. A roster change or a device-added clears this (see below); until then stop issuing
+        // take-keys so a throttle or a genuinely uncertified sibling cannot be drained in a loop.
+        return;
       }
       selfMintDeferredSince = null;
       const own = await account.takeKeys(currentUsername);
@@ -7919,12 +7956,24 @@ export function mountApp(
               .map((d) => ({ deviceKey: d.deviceKey, keyPackage: d.keyPackage }))
           : [];
       if (targets.length === 0) {
+        // THE THROTTLE SIGNATURE. listDevices saw siblings but take-keys returned none: that is either a
+        // rate-limited claim (returned as 200 + empty list, not 429) or siblings with no publishable
+        // package. Both are "stop asking for a while", and both used to look like a benign no-op.
+        selfMintFailures += 1;
+        if (ownDeviceKeys.length > 1) {
+          console.warn(
+            `self-group: ${ownDeviceKeys.length} devices in the directory but take-keys returned none ` +
+              `(attempt ${selfMintFailures}/${SELF_MINT_MAX_FAILURES}) — rate limit or unpublished packages`,
+          );
+        }
         return; // no sibling key packages claimable yet: defer to the next trigger
       }
       await controller.ensureSelfGroup(targets);
+      selfMintFailures = 0; // a real mint landed
       await publishOwnKeys(); // the claim consumed one-time packages: top the directory back up
     } catch (err: unknown) {
       console.warn('ensure self-group failed:', err instanceof Error ? err.message : String(err));
+      selfMintFailures += 1; // a throwing mint burns prekeys too; back off like the empty-claim case
       // The claim above may still have consumed packages (a birth-gate rejection lands here): top our
       // own directory rows back up so peers are not pushed onto our last-resort package meanwhile.
       void publishOwnKeys();
@@ -9023,8 +9072,13 @@ export function mountApp(
       const transmit = await controller.openNoteToSelf();
       go({ kind: 'conversation', transmit });
     } catch (err: unknown) {
-      console.warn('note to self failed:', err instanceof Error ? err.message : String(err));
-      notify('Could not open Note to Self', '', 440);
+      const detail = err instanceof Error ? err.message : String(err);
+      console.warn('note to self failed:', detail);
+      // Show the REAL reason, not a generic string. This one line reads identically whether the device
+      // is cert-only and still waiting for a Welcome, whether the vault could not be sealed, or whether
+      // the self-group is poisoned — and the phone has no console, so a generic message ends the
+      // diagnosis right here. The wasm reasons name a cause and no secrets.
+      notify('Could not open Note to Self', detail, 440);
     }
   }
 
@@ -9614,6 +9668,7 @@ export function mountApp(
       // heal it into the group now (H1): the new device receives going forward. No-op if no conversation.
       void reconcileRemovals();
       void reconcileSiblings();
+      selfMintFailures = 0; // real news about the roster: retry even if we had parked
       void ensureSelfGroup(); // and bring the new device into the buddy-list self-group
       // The new device publishes its key package AFTER this event, so the calls above find nothing
       // claimable yet. Poll (by the device's own key) until it publishes, then heal it into the self-group
@@ -9652,6 +9707,7 @@ export function mountApp(
         reconcileTimer = null;
         void reconcileRemovals();
         void reconcileSiblings();
+        selfMintFailures = 0; // the roster genuinely changed: a parked mint deserves another attempt
         void ensureSelfGroup(); // a newly learned sibling may mean the self-group still needs creating
       }, RECONCILE_DEBOUNCE_MS);
 

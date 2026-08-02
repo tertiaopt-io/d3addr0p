@@ -1340,7 +1340,40 @@ describe('GroupChannel', () => {
     conv.members = [SELF, SIBLING]; // ...but it HAS a sibling: it actually syncs
     await ch.startConversation([{ deviceKey: hx('bb'), keyPackage: new Uint8Array([7]) }]);
     await Promise.resolve();
-    // A populated self-group suffices: no certified-solo replacement is minted over it.
+    // THE ISLAND INVARIANT, stated precisely: openSelfConversation must hand back the EXISTING populated
+    // group and must never mint a SOLO replacement over it. That is what stranded devices before.
+    const opened = await ch.openSelfConversation();
+    expect(opened).toBe(CID);
+    expect(conv.createSelfCalls).toBe(0);
+  });
+
+  it('a populated self-group whose OWN leaf is certless asks for a CERTIFIED replacement (deadlock fix)', async () => {
+    // The state that deadlocked a live account. lenient && !strict means OUR OWN leaf is the failing one
+    // (lenient differs from strict solely by the own-leaf exemption), so the group looks healthy HERE and
+    // is a ghost on every sibling. Nothing can rewrite a leaf credential, so hasSelfGroup must report
+    // false and let the app mint a POPULATED certified replacement. Before this, hasSelfGroup returned
+    // true forever and the device sat on an unusable group no reload could shift.
+    await ch.connectGateway('ws://x/ws');
+    conv.selfConversation = true;
+    conv.strictSelf = false;
+    conv.members = [SELF, SIBLING];
+    await ch.startConversation([{ deviceKey: hx('bb'), keyPackage: new Uint8Array([7]) }]);
+    await Promise.resolve();
+    expect(ch.hasSelfGroup()).toBe(false); // the app will now mint a certified replacement
+
+    // ANTI-LOOP: a device whose OWN credential is still label-only would mint an equally poisoned
+    // group on every trigger, forever. It must park instead.
+    conv.credentialCertifiedFlag = false;
+    expect(ch.hasSelfGroup()).toBe(true);
+    conv.credentialCertifiedFlag = true;
+
+    // A CERT-ONLY device anchors nothing and must never drive a replacement: it waits for a Welcome.
+    conv.accountKey = '';
+    expect(ch.hasSelfGroup()).toBe(true);
+    conv.accountKey = 'acct';
+
+    // And once the group classifies strict, the replacement is no longer wanted.
+    conv.strictSelf = null; // strict mirrors selfConversation === true
     expect(ch.hasSelfGroup()).toBe(true);
   });
 
